@@ -55,6 +55,37 @@ with no activated virtualenv, so a bare `pytest` resolves against whatever is
 on `PATH` (or nothing at all). Pinning to the current interpreter keeps the
 agent's test feedback deterministic.
 
+### Prompts live on disk, not in Python string literals
+Date: 2026-08-04
+Decision: Baseline prompts are markdown files under `configs/prompts/`, loaded
+and filled by `agent/core/prompts.py`. Filling is stricter than `str.format`:
+a template placeholder with no value, *or* a supplied value whose placeholder is
+not in the template (i.e. a typo), raises `PromptError` before the request is
+made. Substitution is a single regex pass, so a value that itself contains
+`{something}` — very likely, since the values are source code — is inserted
+verbatim and never re-expanded.
+Rationale: a prompt edit should be reviewable as a prompt edit, and a prompt
+that reaches the API with a literal `{file_content}` in it burns tokens and
+returns nonsense. Fail locally instead.
+
+### The baseline records failure rather than raising it
+Date: 2026-08-04
+Decision: `run_baseline` returns an `error` field alongside `success`. A model
+reply with no usable code block sets `error`, leaves the file untouched, and
+returns — it does not raise, and it does not re-ask.
+Rationale: "the single-shot agent produced an unparseable answer" is exactly the
+kind of failure M8 needs to count. Raising would make the baseline look broken
+instead of weak, which is the whole comparison. Retrying would make it not a
+baseline.
+
 ## Current status
 M1 complete — tool layer built and tested (106 tests passing, 95% coverage on
-`agent.tools`). Next: M2, the core ReAct loop and single-shot baseline agent.
+`agent.tools`).
+
+M2 partially complete — the single-shot baseline agent is built and tested
+(`agent/core/llm_client.py`, `prompts.py`, `baseline.py`; 28 new tests, 139
+passing offline plus 1 live-API integration test). The baseline is deliberately
+one LLM call with no iteration and no tool use during reasoning: it is the floor
+M8 measures the real agent against. The ReAct loop half of M2 is folded into M3.
+Verified end to end against the calculator fixture: one call, a one-line diff,
+2 tests passing, 660 tokens. Next: M3, the multi-turn ReAct planning loop.
