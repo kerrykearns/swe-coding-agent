@@ -9,6 +9,10 @@
 # swap this for `agent-framework-core==1.13.0` plus only the extras we use.
 agent-framework==1.13.0
 
+# --- Model provider client ---
+# OpenAI SDK, used as the OpenAI-compatible client for Groq (base_url override).
+openai==2.53.0
+
 # --- GitHub API ---
 PyGithub==2.9.1
 
