@@ -1,0 +1,28 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+# The fixture repos under demo/sample_repos are deliberately broken; they are
+# copied into tmp_path by the tests that need them and must never be collected
+# as part of this project's own suite.
+norecursedirs = [
+    ".git",
+    ".venv",
+    "build",
+    "dist",
+    "demo/sample_repos",
+    "workspaces",
+]
+
+[tool.coverage.run]
+source = ["agent"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

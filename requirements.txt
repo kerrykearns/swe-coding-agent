@@ -7,12 +7,11 @@
 # umbrella package that pulls in core + all optional integrations (Azure AI,
 # OpenAI, Copilot Studio, DevUI, etc.). If the install footprint gets painful,
 # swap this for `agent-framework-core==1.13.0` plus only the extras we use.
-agent-framework==1.13.0
+agent-framework-core>=1.13.0
 
 # --- Model provider client ---
 # OpenAI SDK, used as the OpenAI-compatible client for Groq (base_url override).
-openai==2.53.0
-
+openai>=1.0
 # --- GitHub API ---
 PyGithub==2.9.1
 
@@ -20,11 +19,11 @@ PyGithub==2.9.1
 docker==7.2.0
 
 # --- Trajectory memory ---
-redis==8.1.0
+redis>=6.4.0,<7.2.1
 
 # --- Config / secrets ---
 python-dotenv==1.2.2
-pydantic==2.13.4
+pydantic>=2.0
 
 # --- Evaluation & testing ---
 pytest==9.1.1
