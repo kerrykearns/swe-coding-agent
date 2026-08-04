@@ -22,6 +22,7 @@ __all__ = [
     "placeholders",
     "render_baseline_prompts",
     "render_prompt",
+    "render_react_prompts",
     "render_template",
 ]
 
@@ -133,5 +134,30 @@ def render_baseline_prompts(
         task_description=task_description,
         file_path=file_path,
         file_content=file_content,
+    )
+    return system_prompt, user_prompt
+
+
+def render_react_prompts(
+    task_description: str,
+    file_listing: str,
+    prompts_dir: Path | None = None,
+) -> tuple[str, str]:
+    """Build the ReAct loop's opening ``(system_prompt, user_prompt)`` pair.
+
+    Only the *first* user message is templated. Every later message in a ReAct
+    run is a tool result, generated from real data at runtime, so it has no
+    template to live in.
+
+    The system template takes no placeholders and is loaded verbatim; the user
+    template is filled with the task and a listing of the repository, which is
+    the agent's only orientation before it starts calling tools.
+    """
+    system_prompt = load_prompt("react_system.md", prompts_dir)
+    user_prompt = render_prompt(
+        "react_user_template.md",
+        prompts_dir=prompts_dir,
+        task_description=task_description,
+        file_listing=file_listing,
     )
     return system_prompt, user_prompt

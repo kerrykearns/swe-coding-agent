@@ -25,8 +25,10 @@ __all__ = [
     "LLMConfigError",
     "api_key_present",
     "chat_completion",
+    "chat_with_tools",
     "get_client",
     "get_model",
+    "malformed_tool_call",
 ]
 
 # Load `.env` once, on import, so every entrypoint (CLI, tests, eval harness)
@@ -44,6 +46,11 @@ DEFAULT_MODEL = "llama-3.3-70b-versatile"
 _PLACEHOLDER_KEYS = frozenset(
     {"your_groq_api_key_here", "gsk_xxxxxxxxxxxxxxxxxxxxxxxx", "changeme"}
 )
+
+#: Provider error codes meaning "the model tried to call a tool and garbled the
+#: syntax". Groq parses tool calls server-side, so a malformed call comes back as
+#: an HTTP 400 rather than as assistant text — see :func:`malformed_tool_call`.
+_MALFORMED_TOOL_CALL_CODES = frozenset({"tool_use_failed"})
 
 _MISSING_KEY_MESSAGE = (
     "GROQ_API_KEY is not set (or is still the .env.example placeholder).\n"
@@ -141,6 +148,118 @@ def chat_completion(
     usage = getattr(response, "usage", None)
     return {
         "content": content,
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+    }
+
+
+def malformed_tool_call(exc: Exception) -> str | None:
+    """Classify ``exc`` as "the model garbled its tool call", or not.
+
+    Groq validates tool calls on its own side, so a model that emits a
+    syntactically broken call does not come back as an odd-looking assistant
+    message — the request fails outright with HTTP 400 and
+    ``code: "tool_use_failed"``. That is a *retryable mistake by the model*,
+    not a broken run, and telling the two apart needs provider-specific
+    knowledge, which is why it lives in this module rather than in the agent.
+
+    Args:
+        exc: An exception raised by :func:`chat_with_tools`.
+
+    Returns:
+        ``None`` if this is a real failure (auth, rate limit, network, bad
+        request of any other kind) that the caller should treat as fatal.
+        Otherwise the text the model *tried* to emit, taken from the provider's
+        ``failed_generation`` field — possibly ``""`` if the provider did not
+        include it. Callers must therefore test ``is not None``, not truthiness.
+    """
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return None
+
+    # The ``openai`` SDK unwraps the provider's ``{"error": {...}}`` envelope
+    # before building the exception, so ``body`` is normally the inner dict
+    # already. Both shapes are accepted rather than relying on that.
+    inner = body.get("error")
+    error = inner if isinstance(inner, dict) else body
+
+    if str(error.get("code") or "") not in _MALFORMED_TOOL_CALL_CODES:
+        return None
+    return str(error.get("failed_generation") or "")
+
+
+def chat_with_tools(
+    client: OpenAI,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    model: str | None = None,
+    temperature: float = 0.0,
+) -> dict:
+    """Make one tool-enabled chat completion call over a full message history.
+
+    The multi-turn counterpart to :func:`chat_completion`: it takes the whole
+    conversation rather than a system/user pair, and it advertises tools so the
+    model can answer with a structured tool call instead of prose.
+
+    Args:
+        client: A client from :func:`get_client`.
+        messages: The conversation so far, in OpenAI wire format — including
+            ``assistant`` messages carrying ``tool_calls`` and the ``tool``
+            messages that answer them.
+        tools: Tool specifications, each ``{"type": "function", "function":
+            {...}}``. Omitted from the request entirely when empty, since some
+            providers reject an explicit null.
+        model: Model name; defaults to :func:`get_model`.
+        temperature: Defaults to 0, as for :func:`chat_completion`.
+
+    Returns:
+        A dict with:
+
+        * ``content`` — the assistant's text, ``""`` if it emitted none. A model
+          answering with a tool call often says nothing, which is not an error.
+        * ``tool_calls`` — a list of ``{"id", "name", "arguments"}`` dicts, empty
+          if the model made none. ``arguments`` is the raw JSON *string* the
+          model produced: it is deliberately not parsed here, because a model
+          that emits malformed JSON is something the caller must observe and
+          recover from, not something this layer should raise over.
+        * ``finish_reason`` — the provider's stop reason, or ``""``.
+        * ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens`` — usage,
+          ``0`` if the provider omitted a usage block.
+
+    Raises:
+        openai.OpenAIError: Propagated unchanged, as in :func:`chat_completion`.
+    """
+    request: dict = {
+        "model": model or get_model(),
+        "messages": list(messages),
+        "temperature": temperature,
+        "stream": False,
+    }
+    if tools:
+        request["tools"] = list(tools)
+
+    response = client.chat.completions.create(**request)
+
+    choice = response.choices[0] if response.choices else None
+    message = getattr(choice, "message", None)
+
+    tool_calls = []
+    for call in getattr(message, "tool_calls", None) or []:
+        function = getattr(call, "function", None)
+        tool_calls.append(
+            {
+                "id": getattr(call, "id", "") or "",
+                "name": getattr(function, "name", "") or "",
+                "arguments": getattr(function, "arguments", "") or "",
+            }
+        )
+
+    usage = getattr(response, "usage", None)
+    return {
+        "content": getattr(message, "content", "") or "",
+        "tool_calls": tool_calls,
+        "finish_reason": getattr(choice, "finish_reason", "") or "",
         "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
         "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
         "total_tokens": getattr(usage, "total_tokens", 0) or 0,
