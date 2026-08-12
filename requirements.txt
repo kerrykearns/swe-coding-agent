@@ -25,6 +25,10 @@ redis>=6.4.0,<7.2.1
 python-dotenv==1.2.2
 pydantic>=2.0
 
+# --- Safety / refusal layer (M6) ---
+# configs/safety_policy.yaml is parsed by agent/safety/risk_classifier.py.
+PyYAML>=6.0
+
 # --- Evaluation & testing ---
 pytest==9.1.1
 pytest-cov==7.1.0

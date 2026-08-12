@@ -33,6 +33,7 @@ from agent.core.repo_manager import (
     clone_repo,
     commit_changes,
     create_branch,
+    push_branch,
     sanitize_branch_name,
 )
 from agent.tools import Workspace, read_file, write_file
@@ -789,18 +790,22 @@ def test_commit_changes_tolerates_an_unreadable_head(monkeypatch, git_ws: Worksp
 
 
 # --------------------------------------------------------------------------
-# M4 scoping: this module does not push
+# Branch and commit never push on their own
 # --------------------------------------------------------------------------
 
 
-def test_no_git_push_is_ever_issued(git_ws: Workspace, monkeypatch, tmp_path):
-    """M4's scoping constraint, asserted at the level of the commands run.
+def test_no_git_push_is_ever_issued_by_branch_or_commit(
+    git_ws: Workspace, monkeypatch, tmp_path
+):
+    """Only :func:`push_branch` may push, and nothing here calls it for you.
 
-    A local commit is undone with ``git reset``; a pushed branch is public.
-    Pushing waits for M6's confirmation gate, so every command this module
-    issues is recorded here and checked. Asserted behaviourally rather than by
-    grepping the source, which would also match the docstrings that explain the
-    constraint.
+    A local commit is undone with ``git reset``; a pushed branch is public,
+    which is why pushing is its own function, gated by M6's confirmation
+    layer at every call site — see :mod:`agent.safety.confirmation_gate`.
+    ``create_branch``/``commit_changes`` issuing a push themselves would
+    silently defeat that gate, so every command they issue is recorded and
+    checked here. Asserted behaviourally rather than by grepping the source,
+    which would also match the docstrings that explain the constraint.
     """
     recorded: list[str] = []
     real = repo_manager.run_command
@@ -817,3 +822,104 @@ def test_no_git_push_is_ever_issued(git_ws: Workspace, monkeypatch, tmp_path):
 
     assert recorded, "no git commands were recorded, so this proves nothing"
     assert not any("push" in command for command in recorded), recorded
+
+
+# --------------------------------------------------------------------------
+# push_branch (M6) — against a fake git, so nothing touches the network
+# --------------------------------------------------------------------------
+
+
+class _FakePush:
+    """Records every command handed to it and answers all of them the same way.
+
+    Unlike ``_FakeGit`` (which only fakes ``git clone`` and passes everything
+    else straight through as a bare success), ``push_branch`` is the thing
+    under test here, so its one command needs to be configurable per test.
+    """
+
+    def __init__(
+        self, exit_code: int = 0, stdout: str = "", stderr: str = "", timed_out: bool = False
+    ) -> None:
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+        self.calls: list[dict] = []
+
+    def __call__(self, ws: Workspace, command: str, timeout: int = 30) -> dict:
+        self.calls.append({"command": command, "timeout": timeout})
+        return {
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "exit_code": self.exit_code,
+            "timed_out": self.timed_out,
+        }
+
+    @property
+    def commands(self) -> list[str]:
+        return [call["command"] for call in self.calls]
+
+    def command_starting(self, prefix: str) -> str:
+        matches = [command for command in self.commands if command.startswith(prefix)]
+        assert matches, f"no command started with {prefix!r}; got {self.commands}"
+        return matches[0]
+
+
+@pytest.fixture
+def fake_push(monkeypatch) -> _FakePush:
+    fake = _FakePush()
+    monkeypatch.setattr(repo_manager, "run_command", fake)
+    monkeypatch.setenv("GITHUB_TOKEN", FAKE_TOKEN)
+    return fake
+
+
+def test_push_branch_pushes_the_named_branch_to_itself(fake_push, git_ws):
+    push_branch(git_ws, "agent-fix/issue-1", "owner/repo")
+    command = fake_push.command_starting("git push")
+    assert '"agent-fix/issue-1:agent-fix/issue-1"' in command
+
+
+def test_push_branch_embeds_the_token_in_the_url_not_the_stored_remote(
+    fake_push, git_ws
+):
+    """Mirrors clone_repo's credential hygiene: the token never touches origin."""
+    push_branch(git_ws, "agent-fix/issue-1", "owner/repo")
+    command = fake_push.command_starting("git push")
+    assert f"x-access-token:{FAKE_TOKEN}@github.com/owner/repo.git" in command
+    assert not any(c.startswith("git remote set-url") for c in fake_push.commands)
+
+
+def test_push_branch_reports_failure_without_raising(fake_push, git_ws):
+    fake_push.exit_code = 1
+    fake_push.stderr = "! [rejected]  agent-fix/issue-1 -> agent-fix/issue-1 (non-fast-forward)"
+
+    result = push_branch(git_ws, "agent-fix/issue-1", "owner/repo")
+    assert result["success"] is False
+    assert "rejected" in result["reason"]
+
+
+def test_push_branch_redacts_the_token_on_failure(fake_push, git_ws):
+    fake_push.exit_code = 128
+    fake_push.stderr = (
+        f"fatal: unable to access 'https://x-access-token:{FAKE_TOKEN}"
+        "@github.com/owner/repo.git/': failed to connect"
+    )
+
+    result = push_branch(git_ws, "agent-fix/issue-1", "owner/repo")
+    assert FAKE_TOKEN not in result["reason"]
+    assert FAKE_TOKEN not in result["output"]
+    assert "***" in result["output"]
+
+
+def test_push_branch_reports_a_timeout(fake_push, git_ws):
+    fake_push.timed_out = True
+    fake_push.exit_code = -1
+
+    result = push_branch(git_ws, "agent-fix/issue-1", "owner/repo", timeout=5)
+    assert result["success"] is False
+    assert "timed out" in result["reason"]
+
+
+def test_push_branch_rejects_a_blank_branch_name(fake_push, git_ws):
+    with pytest.raises(ValueError):
+        push_branch(git_ws, "   ", "owner/repo")

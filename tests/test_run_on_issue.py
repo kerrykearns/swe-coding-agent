@@ -34,6 +34,7 @@ from agent.core.run_on_issue import (
     print_run_summary,
     run_on_issue,
 )
+from agent.safety import ConfirmationGate
 from agent.tools import Workspace, read_file
 
 from .conftest import CALCULATOR_FIXTURE, git, init_repo
@@ -439,13 +440,18 @@ def test_the_summary_reports_the_trajectory_numbers(tmp_path, stub_github, fake_
 
 
 def test_the_summary_ends_with_the_no_push_note(tmp_path, stub_github, fake_clone):
-    """The one thing a reader must not get wrong: this was not delivered."""
+    """The one thing a reader must not get wrong: this was not delivered.
+
+    ``_run`` calls ``run_on_issue`` with no ``confirmation_gate`` — the
+    library default — so push/PR is never attempted, exactly as in M4.
+    """
     result = _run(tmp_path, stub_github, _fixing_client())
     printed = _rendered_summary(result)
 
     assert "Review before pushing" in printed
-    assert "not yet implemented" in printed
-    assert "M6" in printed
+    assert "not completed this run" in printed
+    assert result["push"] is None
+    assert result["pull_request"] is None
 
 
 def test_the_no_push_note_names_the_branch(tmp_path, stub_github, fake_clone):
@@ -489,19 +495,21 @@ def test_the_summary_does_not_claim_a_commit_that_did_not_happen(
 
 
 # --------------------------------------------------------------------------
-# M4 scoping: no push, no pull request
+# M6: push/PR is opt-in, and only ever runs behind the confirmation gate
 # --------------------------------------------------------------------------
 
 
-def test_the_whole_flow_never_pushes_and_never_opens_a_pull_request(
+def test_no_gate_means_no_push_and_no_pull_request(
     tmp_path, stub_github, fake_clone, monkeypatch
 ):
-    """M4's scoping constraint over the assembled flow, not just its parts.
+    """The M4 behaviour survives M6 unchanged when no gate is supplied.
 
-    Every git command the flow issues is recorded and checked, and
-    ``create_pull_request`` is replaced with a landmine. Asserted behaviourally
-    because the source of these modules mentions both actions in the docstrings
-    that explain why they are absent.
+    ``_run`` (like every other test in this file) calls ``run_on_issue`` with
+    no ``confirmation_gate`` — the library default. Every git command the
+    flow issues is recorded and checked, and ``create_pull_request`` is
+    replaced with a landmine. Asserted behaviourally because the source of
+    these modules mentions both actions in the docstrings that explain why
+    they are absent here.
     """
     recorded: list[str] = []
     real = repo_manager.run_command
@@ -511,7 +519,7 @@ def test_the_whole_flow_never_pushes_and_never_opens_a_pull_request(
         return real(workspace, command, timeout=timeout)
 
     def explode(*args, **kwargs):
-        raise AssertionError("create_pull_request was called during an M4 run")
+        raise AssertionError("create_pull_request was called with no gate supplied")
 
     monkeypatch.setattr(repo_manager, "run_command", record)
     monkeypatch.setattr(github_client, "create_pull_request", explode)
@@ -519,9 +527,116 @@ def test_the_whole_flow_never_pushes_and_never_opens_a_pull_request(
     result = _run(tmp_path, stub_github, _fixing_client())
 
     assert result["committed"] is True
+    assert result["push"] is None
+    assert result["pull_request"] is None
     assert recorded, "no git commands were recorded, so this proves nothing"
     assert not any("push" in command for command in recorded), recorded
     assert not any("remote add" in command for command in recorded), recorded
+
+
+def test_a_gate_that_approves_pushes_and_opens_a_pull_request(
+    tmp_path, stub_github, fake_clone, monkeypatch
+):
+    """With a gate that says yes, push and PR both happen, in order."""
+    calls: list[str] = []
+
+    def fake_push(ws, branch_name, repo_full_name, **kwargs):
+        calls.append(f"push:{branch_name}")
+        return {"success": True, "output": "pushed", "reason": None}
+
+    def fake_create_pr(repo_full_name, branch, base, title, body, client=None):
+        calls.append(f"pr:{branch}->{base}")
+        return {
+            "number": 7,
+            "url": f"https://github.com/{repo_full_name}/pull/7",
+            "title": title,
+            "state": "open",
+            "head": branch,
+            "base": base,
+        }
+
+    monkeypatch.setattr(repo_manager, "push_branch", fake_push)
+    monkeypatch.setattr(github_client, "create_pull_request", fake_create_pr)
+
+    gate = ConfirmationGate(confirm_callback=lambda *_args: True)
+    result = _run(tmp_path, stub_github, _fixing_client(), confirmation_gate=gate)
+
+    assert calls == ["push:agent-fix/issue-1", "pr:agent-fix/issue-1->main"]
+    assert result["push"]["success"] is True
+    assert result["pull_request"]["number"] == 7
+    assert result["pull_request"]["url"].endswith("/pull/7")
+
+    # Both calls were classified needs_confirmation and actually asked.
+    decisions = {entry.tool_name: entry.decision for entry in gate.audit_log}
+    assert decisions["push_branch"] == "confirmed"
+    assert decisions["create_pull_request"] == "confirmed"
+
+
+def test_a_gate_that_denies_stops_before_pushing(
+    tmp_path, stub_github, fake_clone, monkeypatch
+):
+    """A 'no' from the callback must actually stop the flow, not just log it."""
+
+    def explode_push(*args, **kwargs):
+        raise AssertionError("push_branch was called despite the gate denying it")
+
+    def explode_pr(*args, **kwargs):
+        raise AssertionError("create_pull_request was called despite the gate denying it")
+
+    monkeypatch.setattr(repo_manager, "push_branch", explode_push)
+    monkeypatch.setattr(github_client, "create_pull_request", explode_pr)
+
+    gate = ConfirmationGate(confirm_callback=lambda *_args: False)
+    result = _run(tmp_path, stub_github, _fixing_client(), confirmation_gate=gate)
+
+    assert result["committed"] is True
+    assert result["push"] is None
+    assert result["pull_request"] is None
+    assert gate.audit_log[-1].decision == "denied"
+
+
+def test_auto_push_pre_supplies_yes_without_skipping_the_gate(
+    tmp_path, stub_github, fake_clone, monkeypatch
+):
+    """``auto_push`` changes the answer, not whether the question is asked.
+
+    The gate's own callback would deny everything; ``auto_push=True`` must
+    still make the push/PR step succeed, by overriding just that callback —
+    proving the gate itself was still consulted (and logged), not bypassed.
+    """
+    monkeypatch.setattr(
+        repo_manager,
+        "push_branch",
+        lambda ws, branch_name, repo_full_name, **kw: {
+            "success": True,
+            "output": "pushed",
+            "reason": None,
+        },
+    )
+    monkeypatch.setattr(
+        github_client,
+        "create_pull_request",
+        lambda repo_full_name, branch, base, title, body, client=None: {
+            "number": 1,
+            "url": f"https://github.com/{repo_full_name}/pull/1",
+            "title": title,
+            "state": "open",
+            "head": branch,
+            "base": base,
+        },
+    )
+
+    gate = ConfirmationGate(confirm_callback=lambda *_args: False)
+    result = _run(
+        tmp_path, stub_github, _fixing_client(), confirmation_gate=gate, auto_push=True
+    )
+
+    assert result["push"]["success"] is True
+    assert result["pull_request"]["number"] == 1
+    # The gate really was asked — it just was not the deciding voice.
+    decisions = [entry.decision for entry in gate.audit_log]
+    assert "confirmed" in decisions
+    assert "denied" not in decisions
 
 
 # --------------------------------------------------------------------------

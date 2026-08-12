@@ -551,24 +551,30 @@ def test_create_pull_request_reports_missing_write_access():
     assert "write access" in str(caught.value)
 
 
-def test_create_pull_request_is_not_called_anywhere_in_the_m4_flow():
-    """M4's scoping constraint, asserted rather than trusted.
+def test_create_pull_request_has_exactly_one_call_site():
+    """Only ``run_on_issue``'s gated push/PR flow may call this directly.
 
-    ``create_pull_request`` is finished and covered above, but nothing in the
-    milestone's flow may invoke it: a PR is an outward-facing action awaiting
-    M6's confirmation gate. This mirrors M3's
-    ``test_no_shell_tool_is_exposed_to_the_agent``, so the constraint cannot be
-    undone by accident.
+    M4's version of this test asserted nothing in the flow called
+    ``create_pull_request`` at all; M6 wires it into
+    ``run_on_issue._push_and_open_pr`` specifically, and only from behind
+    ``ConfirmationGate.authorize()`` (see the gated behaviour itself, tested
+    end to end in ``test_run_on_issue.py``). What still must never change by
+    accident is that no *other* module reaches for it directly — this
+    mirrors M3's ``test_no_shell_tool_is_exposed_to_the_agent``.
     """
     import inspect
 
     from agent.core import repo_manager, run_on_issue, task_from_issue
 
-    for module in (repo_manager, run_on_issue, task_from_issue):
+    assert "create_pull_request(" in inspect.getsource(run_on_issue), (
+        "run_on_issue no longer calls create_pull_request — if the push/PR "
+        "flow moved, update this test to point at its new location"
+    )
+    for module in (repo_manager, task_from_issue):
         source = inspect.getsource(module)
         assert "create_pull_request(" not in source, (
-            f"{module.__name__} calls create_pull_request; opening a PR is M6's "
-            "decision, not M4's"
+            f"{module.__name__} calls create_pull_request directly; that call "
+            "must go through run_on_issue's confirmation gate instead"
         )
 
 

@@ -44,6 +44,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
+from ..safety import ConfirmationGate
 from ..tools import (
     SandboxContainer,
     SandboxError,
@@ -395,6 +396,7 @@ def execute_tool(
     tool_name: str,
     arguments: dict,
     sandbox: Optional[SandboxContainer] = None,
+    confirmation_gate: Optional[ConfirmationGate] = None,
 ) -> dict:
     """Run one tool against ``workspace`` and return the observation.
 
@@ -412,11 +414,36 @@ def execute_tool(
         sandbox: An already-open
             :class:`~agent.tools.sandbox.SandboxContainer` that ``run_tests``
             runs inside, when the run is sandboxed. ``None`` runs locally.
+        confirmation_gate: M6's safety layer. When given, every call is
+            classified and — for a ``needs_confirmation`` or ``blocked``
+            action — authorized before it runs; a denial is returned as a
+            normal ``{"ok": False, ...}`` observation, never a crash, so the
+            agent can adapt. ``None`` (the default) skips gating entirely,
+            matching every milestone before this one — see the differing CLI
+            vs. library defaults on :func:`run_react_agent`.
 
     Returns:
         ``{"ok": True, ...}`` with tool-specific fields, or
         ``{"ok": False, "error": str}``.
     """
+    if confirmation_gate is not None:
+        gate_args = dict(arguments)
+        if tool_name == "run_tests":
+            # sandboxed is run-level configuration, not something the model
+            # supplies itself, so it is added here purely for classification.
+            gate_args["sandboxed"] = sandbox is not None
+        authorization = confirmation_gate.authorize(tool_name, gate_args)
+        if not authorization.allowed:
+            return {
+                "ok": False,
+                "error": (
+                    f"This action was denied by the safety gate "
+                    f"({authorization.tier}): {authorization.reason}"
+                ),
+                "denied": True,
+                "tier": authorization.tier,
+            }
+
     try:
         if tool_name == "read_file":
             return {"ok": True, "content": read_file(workspace, arguments["path"])}
@@ -624,6 +651,7 @@ def run_react_agent(
     client=None,
     on_turn: Optional[Callable[[Turn], None]] = None,
     sandboxed: bool = False,
+    confirmation_gate: Optional[ConfirmationGate] = None,
 ) -> Trajectory:
     """Work on ``task_description`` in ``workspace``, one tool action per turn.
 
@@ -648,6 +676,13 @@ def run_react_agent(
         sandboxed: Run ``run_tests`` inside a single Docker container (no
             network access) shared across every turn of this run, instead of
             as local subprocesses. See :mod:`agent.tools.sandbox`.
+        confirmation_gate: M6's safety layer, threaded into every
+            :func:`execute_tool` call. ``None`` (the default) runs every
+            turn ungated, exactly as every milestone before M6 did — this
+            library function stays conservative like every other default in
+            this project (see the sandboxing default-disagreement decision
+            in planning.md); the CLI below opts into a real, interactive
+            gate by default instead.
 
     Returns:
         A :class:`Trajectory`. The run stops when the agent calls ``finish``,
@@ -770,7 +805,13 @@ def run_react_agent(
             elif call["name"] == FINISH_TOOL:
                 observation = {"ok": True, **arguments}
             else:
-                observation = execute_tool(workspace, call["name"], arguments, sandbox=sandbox)
+                observation = execute_tool(
+                    workspace,
+                    call["name"],
+                    arguments,
+                    sandbox=sandbox,
+                    confirmation_gate=confirmation_gate,
+                )
 
             if len(calls) > 1:
                 observation["extra_calls_ignored"] = len(calls) - 1
@@ -858,6 +899,17 @@ def main(
             "iteration on fixtures already on disk."
         ),
     ),
+    confirm: bool = typer.Option(
+        True,
+        "--confirm/--no-confirm",
+        help=(
+            "Route every tool call through M6's safety gate, prompting for "
+            "confirmation before a needs_confirmation action (e.g. "
+            "write_file) runs. On by default — this is a real run against a "
+            "real workspace, not a dry read. --no-confirm runs every turn "
+            "ungated, matching every milestone before M6."
+        ),
+    ),
 ) -> None:
     """Iterate — act, observe, adjust — until the tests pass or the turns run out."""
     try:
@@ -872,11 +924,14 @@ def main(
             f"[bold]repo[/bold]      {workspace.root}\n"
             f"[bold]model[/bold]     {model or llm_client.get_model()}\n"
             f"[bold]max turns[/bold] {max_turns}\n"
-            f"[bold]sandbox[/bold]   {sandbox}",
+            f"[bold]sandbox[/bold]   {sandbox}\n"
+            f"[bold]confirm[/bold]   {confirm}",
             title="ReAct agent",
             border_style="cyan",
         )
     )
+
+    gate = ConfirmationGate() if confirm else None
 
     try:
         trajectory = run_react_agent(
@@ -886,6 +941,7 @@ def main(
             model=model,
             on_turn=_print_turn,
             sandboxed=sandbox,
+            confirmation_gate=gate,
         )
     except llm_client.LLMConfigError as exc:
         console.print(f"[bold red]Configuration error:[/bold red] {exc}")

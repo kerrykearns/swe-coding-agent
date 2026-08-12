@@ -14,7 +14,7 @@ Measured against a single-shot baseline on a curated set of real issues.
       PR creation is written and tested but deliberately not wired in — it waits
       for M6's confirmation gate. Nothing in M4 pushes.
 - [x] M5 — Docker sandboxing for all execution
-- [ ] M6 — Safety/refusal layer (risk classification + human confirmation)
+- [x] M6 — Safety/refusal layer (risk classification + human confirmation)
 - [ ] M7 — Trajectory memory (Redis) + credit-assignment scoring
 - [ ] M8 — Evaluation harness (baseline vs full agent: success rate, avg turns,
       token cost) on curated local dummy repos with known failing tests
@@ -351,6 +351,77 @@ has no such context and should stay conservative so calling it — from tests,
 from `run_react_agent`, from anywhere — never silently starts requiring
 Docker.
 
+### Classification is config, not code — and the fail-safe default is to ask
+
+Decision: `configs/safety_policy.yaml` is the single source of truth for
+which tier a tool call sits in; `agent/safety/risk_classifier.py` only
+loads and matches it — no tier boundaries are hard-coded in Python, and no
+LLM call is involved (deterministic, same input always gives the same
+tier). A tool name covered by no rule in any tier classifies as
+`needs_confirmation` rather than `safe`.
+Rationale: the whole point of an auditable policy is that a human reviewing
+`safety_policy.yaml` can see every rule and its one-line rationale without
+reading classifier code. The fail-safe default matters more than it looks:
+it means a new tool added to the agent's toolset without a matching policy
+rule defaults to *asking*, not to running freely — the gap is caught by a
+confirmation prompt, not by a silent bypass. `risk_classifier`'s module
+docstring is explicit that this is a good-faith safety net for an agent
+working on a legitimate task, not a security boundary hardened against
+deliberately obfuscated adversarial input — that threat model belongs to
+M5's sandbox (process/network isolation), not to regex matching on a
+command string.
+
+### The gate is threaded selectively, not blanket-wired everywhere the policy mentions
+
+Decision: `agent/safety/confirmation_gate.py`'s `ConfirmationGate` is wired
+into exactly two call sites: `react_agent.execute_tool` (every tool the
+agent itself calls: `read_file`, `write_file`, `list_files`, `search_text`,
+`run_tests`, `get_diff`) and `run_on_issue`'s new push/PR step
+(`push_branch`, `create_pull_request`). The safety policy also classifies
+`commit_changes` and `create_branch` (protected names) as
+`needs_confirmation` — both are fully covered by `test_risk_classifier.py`
+— but neither call site actually calls `gate.authorize()` in this
+milestone: `run_on_issue` still commits (and creates its own working
+branch) the same way M4 did, ungated. `run_on_issue` also does NOT thread
+its gate into the ReAct loop it runs internally — the loop stays ungated
+there, and only the post-commit push/PR step is gated.
+Rationale: two things had to be balanced. First, `run_on_issue` runs
+against a *real* GitHub issue for potentially a dozen turns; gating every
+`write_file` there would mean a human blocked at the keyboard for the
+entire run, which is a materially different product from "review before it
+becomes irreversible" — the local commit is exactly as undoable as it was
+in M4 (`git reset`), so it did not need the same treatment as an outbound
+push. Second, this was learned the hard way: an early version threaded one
+gate through both the loop and the push step, and a test built to prove
+`auto_push=True` doesn't skip the gate — using a callback that denies
+everything, then checking `auto_push` still gets a yes — instead found the
+denial blocking `write_file` too, so the agent never got to commit at all
+and the whole scenario under test never ran. A caller that wants the loop
+itself gated can still call `react_agent.run_react_agent` directly with its
+own `ConfirmationGate` (its CLI does exactly this, on by default) — the gap
+is a deliberate scoping choice for `run_on_issue` specifically, not a
+limitation of the gate itself. `commit_changes`/`create_branch` being
+classified but unenforced is logged here rather than left as a silent
+inconsistency, in the same spirit as M4's "the PR function exists and is
+tested but nothing calls it".
+
+### `push_branch` never touches the stored remote
+
+Decision: `agent/core/repo_manager.push_branch` builds a one-off
+authenticated URL (`https://x-access-token:<token>@github.com/...`) and
+passes it directly to `git push`, exactly as `clone_repo` does for the
+clone itself — it never runs `git remote set-url` or otherwise writes the
+token into `.git/config`. Every string it returns has the token redacted
+through the same `_redact` helper `clone_repo` and `commit_changes` already
+use.
+Rationale: `clone_repo` already resets the remote to a token-free URL
+immediately after cloning specifically so a credential never sits in a
+checkout the agent produced (see the M4 decision on this above) — a naive
+`push_branch` that pushed to `origin` would either fail (no credential
+configured) or require re-adding one to the stored remote, undoing that
+work. Passing the URL directly to the one `git push` call keeps the token
+in memory only, for exactly as long as that one command runs.
+
 ## Current status
 M1 complete — tool layer built and tested (106 tests passing, 95% coverage on
 `agent.tools`).
@@ -447,4 +518,35 @@ a decision above, since the same mistake is easy to reintroduce in M6 or M7
 if a library function's default is used to express a policy that belongs at
 the CLI layer instead.
 
-Next: M6, the safety/refusal layer.
+M6 complete — the safety/refusal layer (`configs/safety_policy.yaml`,
+`agent/safety/risk_classifier.py`, `agent/safety/confirmation_gate.py`), plus
+`agent/core/repo_manager.push_branch` and the gated push/PR wiring in
+`run_on_issue.py`. 69 new tests (`test_risk_classifier.py`,
+`test_confirmation_gate.py`), plus new/updated coverage in
+`test_repo_manager.py`, `test_run_on_issue.py`, and `test_github_client.py`
+for `push_branch` and the M6 push/PR flow — 520 tests passing offline
+(`pytest tests/ -m "not integration"`), 0 failing.
+
+`react_agent.execute_tool` now takes an optional `confirmation_gate`; when
+given, every tool call is classified and a `needs_confirmation`/`blocked`
+denial comes back as a normal `{"ok": False, ...}` observation the agent
+reads and can react to, never an exception. `run_react_agent`'s own default
+stays `confirmation_gate=None` (fully ungated, byte-for-byte the M1–M5
+behaviour) — the CLI (`python -m agent.core.react_agent`) is the one that
+opts into a real, interactive `ConfirmationGate` by default
+(`--no-confirm` opts back out), mirroring the sandboxing
+default-disagreement decision above. `run_on_issue` gained
+`confirmation_gate` (used only for its new push/PR step — see the decision
+above on why the loop itself stays ungated there), `auto_push` (still goes
+through `gate.authorize()`, just pre-supplies "yes" for that one step —
+never a bypass), and `pr_base_branch`. Its CLI always builds a gate and
+exposes `--auto-push`.
+
+Verified end to end against the calculator fixture via
+`python -m agent.core.react_agent`: a task requiring `write_file` produced a
+real terminal confirmation prompt; answering `y` let the write proceed and
+the run continued normally; re-run with the same task, answering `n` at the
+prompt produced a denied `write_file` observation, and the agent's next turn
+visibly reacted to the denial instead of the run crashing.
+
+Next: M7, trajectory memory (Redis) and credit-assignment scoring.

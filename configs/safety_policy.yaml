@@ -1,0 +1,137 @@
+# Safety / refusal policy (M6) — read by agent/safety/risk_classifier.py
+#
+# This file is the single source of truth for which agent actions run freely,
+# which need a human to say yes first, and which are refused outright no
+# matter who (or what) says yes. It is meant to be readable and auditable by
+# a human reviewer, not just executable — every rule below carries a
+# one-line rationale explaining *why* it sits where it does.
+#
+# Matching order (see risk_classifier.classify): blocked rules are checked
+# first and unconditionally, then needs_confirmation, then safe. A tool name
+# not covered by any rule falls back to needs_confirmation — an unrecognised
+# action is exactly the case this layer exists to catch, so the fail-safe
+# default asks a human rather than assuming the action is harmless.
+#
+# `tools` — which tool name(s) a rule applies to.
+# `when`  — optional condition on the tool's arguments; a rule with no
+#           `when` matches every call to that tool. Supported keys:
+#             sandboxed: true|false        exact match on tool_args["sandboxed"]
+#             branch_name_in: [...]        tool_args["branch_name"] is one of these (case-insensitive)
+# `pattern` (blocked rules only) — a case-insensitive regex checked against
+#           tool_args[field] (field defaults to "command").
+
+safe:
+  - id: safe_read_file
+    tools: [read_file]
+    rationale: >
+      Reading a file cannot change anything on disk or on GitHub, so it is
+      always allowed without asking.
+
+  - id: safe_list_files
+    tools: [list_files]
+    rationale: Listing a directory is read-only.
+
+  - id: safe_search_text
+    tools: [search_text]
+    rationale: Searching file contents is read-only.
+
+  - id: safe_get_diff
+    tools: [get_diff]
+    rationale: Viewing the working tree's diff is read-only.
+
+  - id: safe_get_status
+    tools: [get_status]
+    rationale: Viewing git status is read-only.
+
+  - id: safe_sandboxed_execution
+    tools: [run_tests, run_command]
+    when:
+      sandboxed: true
+    rationale: >
+      Inside M5's Docker sandbox the process has no network access and its
+      filesystem is a disposable container mount, so a run here cannot reach
+      the host or anything outside the mounted workspace — no confirmation
+      needed.
+
+needs_confirmation:
+  - id: confirm_write_file
+    tools: [write_file]
+    rationale: >
+      Overwrites a file's entire contents. Reversible through git, but a
+      human should see it before it lands rather than after.
+
+  - id: confirm_commit_changes
+    tools: [commit_changes]
+    rationale: >
+      Creates a permanent local commit recording the agent's work. Cheap to
+      undo (git reset), but a human should know what is being recorded.
+
+  - id: confirm_push_branch
+    tools: [push_branch]
+    rationale: >
+      Publishes commits to a remote. Once pushed, history is visible to
+      everyone with access to the repository and is not privately undoable.
+
+  - id: confirm_create_pull_request
+    tools: [create_pull_request]
+    rationale: >
+      Outward-facing: opens a pull request visible on GitHub and can notify
+      reviewers/watchers. The clearest "point of no quiet return" in the flow.
+
+  - id: confirm_unsandboxed_execution
+    tools: [run_tests, run_command]
+    when:
+      sandboxed: false
+    rationale: >
+      Running directly on the host (not inside the M5 sandbox) means the
+      process can touch anything the current OS user can touch — a bigger
+      deal than the same command in a disposable container.
+
+  - id: confirm_create_branch_protected
+    tools: [create_branch]
+    when:
+      branch_name_in: ["main", "master"]
+    rationale: >
+      Creating a branch that shares a name with a common default branch
+      risks confusion with, or accidental interaction with, the
+      repository's primary branch.
+
+blocked:
+  - id: blocked_rm_rf
+    tools: [run_command]
+    pattern: 'rm\s+(-\w*f\w*r\w*|-\w*r\w*f\w*)(\s|$)'
+    rationale: >
+      A recursive, forced delete can destroy the workspace (or, since a
+      shell command is not filesystem-confined, anything else the process
+      can reach). No confirmation can make this safe to run unsupervised.
+
+  - id: blocked_git_push_force
+    tools: [run_command]
+    pattern: 'git\s+push\b.*(--force(-with-lease)?|\s-f\b)'
+    rationale: >
+      A force push can overwrite other people's history on a shared remote.
+      Legitimate pushes go through push_branch (needs_confirmation), which
+      never forces.
+
+  - id: blocked_git_reset_hard
+    tools: [run_command]
+    pattern: 'git\s+reset\s+--hard'
+    rationale: >
+      Irreversibly discards local changes. This classifier only sees the
+      command string, not repository state, so it cannot tell a branch with
+      unpushed commits from one without — it refuses both rather than
+      guess.
+
+  - id: blocked_credential_reference
+    tools: [run_command]
+    pattern: '(^|[\s/"''])\.env\b|credentials?\.json|id_rsa|\.pem\b|secrets?\.ya?ml'
+    rationale: >
+      Commands that read, copy, or transmit credential-shaped files risk
+      leaking secrets (tokens, keys) outside the workspace.
+
+  - id: blocked_pipe_to_shell
+    tools: [run_command]
+    pattern: '(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b'
+    rationale: >
+      Piping a network download straight into a shell executes unreviewed
+      remote code with no chance to inspect it first.

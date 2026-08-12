@@ -6,12 +6,15 @@ root — the same path every other git-touching tool in this project takes (see
 :mod:`agent.tools.diff_tools`). No new subprocess handling is introduced, and
 ``get_status`` is reused rather than reimplemented as a second porcelain parser.
 
-SCOPING CONSTRAINT (M4)
-=======================
-This module clones, branches, and commits. It does NOT push: there is no
-``git push`` here and there must not be one until M6's safety/confirmation gate
-exists. A local commit is trivially undone with ``git reset``; a pushed branch is
-public. The stopping point is deliberate.
+PUSHING (M6)
+============
+:func:`push_branch` exists so :mod:`agent.core.run_on_issue` can push a
+branch — but it must never be called except from behind
+:class:`agent.safety.confirmation_gate.ConfirmationGate`. Nothing in this
+module calls it itself, and nothing here decides that a push should happen;
+that decision, and the human confirmation behind it, belongs entirely to the
+gate. A local commit is trivially undone with ``git reset``; a pushed branch
+is public — see the safety policy's ``confirm_push_branch`` rule.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ __all__ = [
     "commit_changes",
     "create_branch",
     "exclude_agent_artifacts",
+    "push_branch",
     "sanitize_branch_name",
 ]
 
@@ -471,6 +475,84 @@ def commit_changes(ws: Workspace, message: str) -> dict:
         "output": "\n".join(transcript),
         "reason": None,
     }
+
+
+def push_branch(
+    ws: Workspace,
+    branch_name: str,
+    repo_full_name: str,
+    token: Optional[str] = None,
+    use_token: bool = True,
+    timeout: int = GIT_TIMEOUT_SECONDS,
+) -> dict:
+    """Push ``branch_name`` to ``origin``, authenticating for this one call only.
+
+    NOT SAFE TO CALL DIRECTLY FROM AGENT-DRIVEN CODE — see the module
+    docstring. Every caller in this codebase must go through
+    :class:`agent.safety.confirmation_gate.ConfirmationGate` first.
+
+    Follows :func:`clone_repo`'s credential hygiene rather than
+    ``origin``'s: the token is embedded only in the URL given to this one
+    ``git push`` and is never written to ``.git/config`` — the stored
+    remote stays exactly as ``clone_repo`` left it, token-free.
+
+    Args:
+        ws: Workspace pointing at the git repository to push from.
+        branch_name: The local branch to push, pushed to a remote branch of
+            the same name (``git push <url> "<branch>:<branch>"``).
+        repo_full_name: ``"owner/repo"``, used only to rebuild the
+            authenticated URL — the push does not touch the stored remote.
+        token: Token to authenticate with. Defaults to ``GITHUB_TOKEN`` from
+            the environment when ``use_token`` is set and one is configured.
+        use_token: Set False to push anonymously (will fail against a
+            private repository, or any repository requiring write auth).
+        timeout: Seconds before the push is killed.
+
+    Returns:
+        ``{"success": bool, "output": str, "reason": str | None}`` — reports
+        rather than raises for anything git says, the same shape as
+        :func:`commit_changes`, since "the push failed" is an outcome a
+        caller has to describe, not an exception it can do anything about.
+        ``output`` has the token redacted, the same as every other string
+        this module reports.
+
+    Raises:
+        ValueError: If ``branch_name`` is blank — a caller bug, not a state
+            of the repository.
+    """
+    if not branch_name or not branch_name.strip():
+        raise ValueError("Branch name is empty; there is nothing to push.")
+    branch_name = branch_name.strip()
+    repo_full_name = github_client.normalise_repo_name(repo_full_name)
+
+    if token is None and use_token and github_client.token_present():
+        token = github_client.get_token()
+    if not use_token:
+        token = None
+
+    url = _clone_url(repo_full_name, token)
+    command = f'git push "{url}" "{branch_name}:{branch_name}"'
+    result = run_command(ws, command, timeout=timeout)
+    transcript = _redact(_transcribe("git push", result), token)
+
+    if result["timed_out"]:
+        return {
+            "success": False,
+            "output": transcript,
+            "reason": f"Pushing {branch_name!r} timed out after {timeout} seconds.",
+        }
+    if result["exit_code"] != 0:
+        detail = _redact((result["stderr"] or result["stdout"]).strip(), token)
+        return {
+            "success": False,
+            "output": transcript,
+            "reason": (
+                f"git push failed (exit code {result['exit_code']}): "
+                f"{detail or 'no output from git'}"
+            ),
+        }
+
+    return {"success": True, "output": transcript, "reason": None}
 
 
 def _transcribe(label: str, result: dict) -> str:
