@@ -31,6 +31,7 @@ Run it directly against a repo::
 
 from __future__ import annotations
 
+import contextlib
 import json
 from enum import Enum
 from typing import Annotated, Any, Callable, Optional
@@ -44,6 +45,8 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from ..tools import (
+    SandboxContainer,
+    SandboxError,
     Workspace,
     get_diff,
     list_files,
@@ -387,7 +390,12 @@ def _looks_escape_mangled(content: str) -> bool:
     )
 
 
-def execute_tool(workspace: Workspace, tool_name: str, arguments: dict) -> dict:
+def execute_tool(
+    workspace: Workspace,
+    tool_name: str,
+    arguments: dict,
+    sandbox: Optional[SandboxContainer] = None,
+) -> dict:
     """Run one tool against ``workspace`` and return the observation.
 
     Every failure is caught and returned as ``{"ok": False, "error": ...}``. That
@@ -395,6 +403,15 @@ def execute_tool(workspace: Workspace, tool_name: str, arguments: dict) -> dict:
     git repository that is not a git repository are all things the agent should
     see and adapt to, not things that should end the run. Only the LLM call
     itself is allowed to break a run.
+
+    Args:
+        workspace: The repo the tool acts on.
+        tool_name: One of the names in :data:`TOOLS` (or :data:`FINISH_TOOL`,
+            though the loop handles that one itself).
+        arguments: Parsed, schema-validated tool arguments.
+        sandbox: An already-open
+            :class:`~agent.tools.sandbox.SandboxContainer` that ``run_tests``
+            runs inside, when the run is sandboxed. ``None`` runs locally.
 
     Returns:
         ``{"ok": True, ...}`` with tool-specific fields, or
@@ -429,7 +446,15 @@ def execute_tool(workspace: Workspace, tool_name: str, arguments: dict) -> dict:
             return {"ok": True, "matches": matches, "count": len(matches)}
 
         if tool_name == "run_tests":
-            return {"ok": True, **run_tests(workspace, arguments["test_path"])}
+            return {
+                "ok": True,
+                **run_tests(
+                    workspace,
+                    arguments["test_path"],
+                    sandboxed=sandbox is not None,
+                    sandbox=sandbox,
+                ),
+            }
 
         if tool_name == "get_diff":
             return {"ok": True, "diff": get_diff(workspace)}
@@ -598,6 +623,7 @@ def run_react_agent(
     model: str | None = None,
     client=None,
     on_turn: Optional[Callable[[Turn], None]] = None,
+    sandboxed: bool = False,
 ) -> Trajectory:
     """Work on ``task_description`` in ``workspace``, one tool action per turn.
 
@@ -619,6 +645,9 @@ def run_react_agent(
             :func:`~agent.core.llm_client.get_client` when omitted.
         on_turn: Called with each :class:`Turn` as it completes, for live
             progress reporting. Exceptions from it are not caught.
+        sandboxed: Run ``run_tests`` inside a single Docker container (no
+            network access) shared across every turn of this run, instead of
+            as local subprocesses. See :mod:`agent.tools.sandbox`.
 
     Returns:
         A :class:`Trajectory`. The run stops when the agent calls ``finish``,
@@ -656,120 +685,126 @@ def run_react_agent(
         if on_turn is not None:
             on_turn(turn)
 
-    for turn_number in range(1, max_turns + 1):
-        try:
-            reply = llm_client.chat_with_tools(
-                client, messages, tools=schemas, model=model
-            )
-        except Exception as exc:  # noqa: BLE001 - recorded, not raised
-            attempted = llm_client.malformed_tool_call(exc)
-            if attempted is None:
-                # A real failure — auth, rate limit, network. The run is over.
+    # Sandboxed runs open ONE container for the whole run, reused across every
+    # `run_tests` turn — starting a container per turn would be slow, and the
+    # container is torn down (via SandboxContainer.__exit__) whether the loop
+    # below finishes normally, breaks early, or raises.
+    sandbox_cm = SandboxContainer(workspace) if sandboxed else contextlib.nullcontext(None)
+    with sandbox_cm as sandbox:
+        for turn_number in range(1, max_turns + 1):
+            try:
+                reply = llm_client.chat_with_tools(
+                    client, messages, tools=schemas, model=model
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded, not raised
+                attempted = llm_client.malformed_tool_call(exc)
+                if attempted is None:
+                    # A real failure — auth, rate limit, network. The run is over.
+                    record(
+                        Turn(
+                            turn_number=turn_number,
+                            tool_result={
+                                "ok": False,
+                                "error": f"The LLM call failed: {type(exc).__name__}: {exc}",
+                            },
+                        )
+                    )
+                    stop_reason = StopReason.ERROR
+                    break
+
+                # The model garbled its tool call and the provider refused the whole
+                # request. Same class of mistake as answering in prose, so it gets the
+                # same treatment: record the wasted turn, say what went wrong, retry.
+                # The malformed text is deliberately NOT echoed back into the history —
+                # feeding a model its own broken syntax invites it to repeat it — but it
+                # is kept in the trajectory, since "how often does the model fail to
+                # form a tool call at all?" is a real property of the backend.
+                messages.append({"role": "user", "content": _MALFORMED_CALL_NUDGE})
                 record(
                     Turn(
                         turn_number=turn_number,
+                        reasoning=attempted.strip(),
                         tool_result={
                             "ok": False,
-                            "error": f"The LLM call failed: {type(exc).__name__}: {exc}",
+                            "error": (
+                                "The provider rejected the turn: the model's tool call "
+                                "was malformed, so no action was taken."
+                            ),
+                            "failed_generation": attempted,
                         },
                     )
                 )
-                stop_reason = StopReason.ERROR
-                break
+                continue
 
-            # The model garbled its tool call and the provider refused the whole
-            # request. Same class of mistake as answering in prose, so it gets the
-            # same treatment: record the wasted turn, say what went wrong, retry.
-            # The malformed text is deliberately NOT echoed back into the history —
-            # feeding a model its own broken syntax invites it to repeat it — but it
-            # is kept in the trajectory, since "how often does the model fail to
-            # form a tool call at all?" is a real property of the backend.
-            messages.append({"role": "user", "content": _MALFORMED_CALL_NUDGE})
-            record(
-                Turn(
-                    turn_number=turn_number,
-                    reasoning=attempted.strip(),
-                    tool_result={
-                        "ok": False,
-                        "error": (
-                            "The provider rejected the turn: the model's tool call "
-                            "was malformed, so no action was taken."
-                        ),
-                        "failed_generation": attempted,
-                    },
+            reasoning = reply["content"].strip()
+            calls = reply["tool_calls"]
+            tokens = reply["total_tokens"]
+
+            if not calls:
+                # Prose instead of an action. Recorded as a failed turn, nudged, and
+                # retried next turn — one malformed response is not a dead run.
+                messages.append({"role": "assistant", "content": reply["content"] or ""})
+                messages.append({"role": "user", "content": _NO_TOOL_CALL_NUDGE})
+                record(
+                    Turn(
+                        turn_number=turn_number,
+                        reasoning=reasoning,
+                        tool_result={
+                            "ok": False,
+                            "error": (
+                                "The model produced no tool call, so no action was "
+                                "taken this turn."
+                            ),
+                        },
+                        tokens_used=tokens,
+                    )
                 )
+                continue
+
+            call = calls[0]
+            messages.append(_assistant_message(reply["content"] or "", call))
+
+            arguments, error = parse_tool_arguments(call["name"], call["arguments"])
+            if error is not None:
+                observation: dict = {"ok": False, "error": error}
+            elif call["name"] == FINISH_TOOL:
+                observation = {"ok": True, **arguments}
+            else:
+                observation = execute_tool(workspace, call["name"], arguments, sandbox=sandbox)
+
+            if len(calls) > 1:
+                observation["extra_calls_ignored"] = len(calls) - 1
+
+            rendered = _truncate(_render_observation(call["name"], observation))
+            if len(calls) > 1:
+                rendered += (
+                    f"\n\n(You requested {len(calls)} tool calls in one turn; only the "
+                    "first was executed. Take exactly one action per turn.)"
+                )
+            messages.append(
+                {"role": "tool", "tool_call_id": call["id"], "content": rendered}
             )
-            continue
 
-        reasoning = reply["content"].strip()
-        calls = reply["tool_calls"]
-        tokens = reply["total_tokens"]
-
-        if not calls:
-            # Prose instead of an action. Recorded as a failed turn, nudged, and
-            # retried next turn — one malformed response is not a dead run.
-            messages.append({"role": "assistant", "content": reply["content"] or ""})
-            messages.append({"role": "user", "content": _NO_TOOL_CALL_NUDGE})
             record(
                 Turn(
                     turn_number=turn_number,
                     reasoning=reasoning,
-                    tool_result={
-                        "ok": False,
-                        "error": (
-                            "The model produced no tool call, so no action was "
-                            "taken this turn."
-                        ),
-                    },
+                    tool_name=call["name"],
+                    tool_args=arguments,
+                    tool_result=observation,
                     tokens_used=tokens,
                 )
             )
-            continue
 
-        call = calls[0]
-        messages.append(_assistant_message(reply["content"] or "", call))
+            succeeded = observation.get("ok", False)
+            if succeeded and call["name"] == "run_tests" and observation.get("success"):
+                tests_have_passed = True
+                stop_reason = StopReason.TESTS_PASSED
+                break
 
-        arguments, error = parse_tool_arguments(call["name"], call["arguments"])
-        if error is not None:
-            observation: dict = {"ok": False, "error": error}
-        elif call["name"] == FINISH_TOOL:
-            observation = {"ok": True, **arguments}
-        else:
-            observation = execute_tool(workspace, call["name"], arguments)
-
-        if len(calls) > 1:
-            observation["extra_calls_ignored"] = len(calls) - 1
-
-        rendered = _truncate(_render_observation(call["name"], observation))
-        if len(calls) > 1:
-            rendered += (
-                f"\n\n(You requested {len(calls)} tool calls in one turn; only the "
-                "first was executed. Take exactly one action per turn.)"
-            )
-        messages.append(
-            {"role": "tool", "tool_call_id": call["id"], "content": rendered}
-        )
-
-        record(
-            Turn(
-                turn_number=turn_number,
-                reasoning=reasoning,
-                tool_name=call["name"],
-                tool_args=arguments,
-                tool_result=observation,
-                tokens_used=tokens,
-            )
-        )
-
-        succeeded = observation.get("ok", False)
-        if succeeded and call["name"] == "run_tests" and observation.get("success"):
-            tests_have_passed = True
-            stop_reason = StopReason.TESTS_PASSED
-            break
-
-        if succeeded and call["name"] == FINISH_TOOL:
-            stop_reason = StopReason.AGENT_FINISHED
-            break
+            if succeeded and call["name"] == FINISH_TOOL:
+                stop_reason = StopReason.AGENT_FINISHED
+                break
 
     trajectory.stop_reason = stop_reason
     trajectory.final_success = tests_have_passed
@@ -814,6 +849,15 @@ def main(
     show_diff: bool = typer.Option(
         True, "--diff/--no-diff", help="Print the final diff."
     ),
+    sandbox: bool = typer.Option(
+        False,
+        "--sandbox/--no-sandbox",
+        help=(
+            "Run tests inside a network-isolated Docker container instead of "
+            "locally. Off by default here, since this CLI is for fast local "
+            "iteration on fixtures already on disk."
+        ),
+    ),
 ) -> None:
     """Iterate — act, observe, adjust — until the tests pass or the turns run out."""
     try:
@@ -827,7 +871,8 @@ def main(
             f"[bold]task[/bold]      {task}\n"
             f"[bold]repo[/bold]      {workspace.root}\n"
             f"[bold]model[/bold]     {model or llm_client.get_model()}\n"
-            f"[bold]max turns[/bold] {max_turns}",
+            f"[bold]max turns[/bold] {max_turns}\n"
+            f"[bold]sandbox[/bold]   {sandbox}",
             title="ReAct agent",
             border_style="cyan",
         )
@@ -840,9 +885,13 @@ def main(
             max_turns=max_turns,
             model=model,
             on_turn=_print_turn,
+            sandboxed=sandbox,
         )
     except llm_client.LLMConfigError as exc:
         console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        raise typer.Exit(code=2)
+    except SandboxError as exc:
+        console.print(f"[bold red]Sandbox error:[/bold red] {exc}")
         raise typer.Exit(code=2)
 
     _print_final(trajectory, show_diff=show_diff)

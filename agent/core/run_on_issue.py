@@ -31,6 +31,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from ..tools import SandboxError
 from . import github_client, llm_client, repo_manager
 from .react_agent import Trajectory, Turn, run_react_agent
 
@@ -89,6 +90,7 @@ def run_on_issue(
     github=None,
     console: Optional[Console] = None,
     on_turn: Optional[Callable[[Turn], None]] = None,
+    sandboxed: bool = False,
 ) -> dict:
     """Fetch an issue, clone the repo, branch, run the agent, commit if it worked.
 
@@ -105,6 +107,14 @@ def run_on_issue(
         github: Pre-built PyGithub client, mainly for tests.
         console: Where to report progress. ``None`` runs silently.
         on_turn: Per-turn callback for the ReAct loop.
+        sandboxed: Run the agent's ``run_tests`` calls inside a Docker
+            container with no network access rather than as local
+            subprocesses. Defaults to False here, matching every other tool
+            in :mod:`agent.tools` — this function's own default stays
+            conservative and Docker-free so calling it directly (as the tests
+            do) never requires Docker. The CLI below is the one that opts
+            into ``sandboxed=True`` by default, since it always runs the
+            agent against a real, arbitrary cloned repo.
 
     Returns:
         A dict describing the whole run:
@@ -167,6 +177,7 @@ def run_on_issue(
         model=model,
         client=client,
         on_turn=on_turn,
+        sandboxed=sandboxed,
     )
 
     commit: Optional[dict] = None
@@ -224,6 +235,15 @@ def main(
     show_diff: bool = typer.Option(
         True, "--diff/--no-diff", help="Print the final diff."
     ),
+    sandbox: bool = typer.Option(
+        True,
+        "--sandbox/--no-sandbox",
+        help=(
+            "Run tests inside a network-isolated Docker container instead of "
+            "locally. On by default here, since this CLI runs the agent "
+            "against a real cloned repository."
+        ),
+    ),
 ) -> None:
     """Fetch the issue, clone, branch, iterate, and commit locally if it worked."""
     console.print(
@@ -231,7 +251,8 @@ def main(
             f"[bold]repo[/bold]      {repo}\n"
             f"[bold]issue[/bold]     #{issue}\n"
             f"[bold]model[/bold]     {model or llm_client.get_model()}\n"
-            f"[bold]max turns[/bold] {max_turns}",
+            f"[bold]max turns[/bold] {max_turns}\n"
+            f"[bold]sandbox[/bold]   {sandbox}",
             title="agent on a GitHub issue",
             border_style="cyan",
         )
@@ -246,6 +267,7 @@ def main(
             workspaces_dir=workspaces_dir,
             console=console,
             on_turn=_print_turn,
+            sandboxed=sandbox,
         )
     except github_client.GitHubError as exc:
         console.print(f"[bold red]GitHub error:[/bold red] {exc}")
@@ -255,6 +277,9 @@ def main(
         raise typer.Exit(code=2)
     except llm_client.LLMConfigError as exc:
         console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        raise typer.Exit(code=2)
+    except SandboxError as exc:
+        console.print(f"[bold red]Sandbox error:[/bold red] {exc}")
         raise typer.Exit(code=2)
 
     _print_final(result["trajectory"], show_diff=show_diff)

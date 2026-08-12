@@ -7,6 +7,8 @@ test fails — so a correct parser must report 1 failed, 1 passed.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from agent.tools import Workspace, run_tests, write_file
@@ -76,6 +78,68 @@ def test_all_passing_workspace(ws: Workspace):
     result = run_tests(ws)
     assert (result["passed"], result["failed"], result["total"]) == (2, 0, 2)
     assert result["success"] is True
+
+
+# --------------------------------------------------------------------------
+# sandboxed dispatch (mocked run_command, no real Docker needed)
+# --------------------------------------------------------------------------
+
+
+def test_sandboxed_uses_the_containers_python_not_sys_executable(ws: Workspace, monkeypatch):
+    """Inside the container sys.executable names the *host* interpreter, which
+    does not exist there — the sandbox image's own `python` must be used.
+    """
+    import agent.tools.test_runner as test_runner_module
+
+    captured: dict = {}
+
+    def fake_run_command(workspace, command, timeout=30, sandboxed=False, sandbox=None):
+        captured["command"] = command
+        captured["sandboxed"] = sandboxed
+        captured["sandbox"] = sandbox
+        return {"stdout": "1 passed in 0.01s", "stderr": "", "exit_code": 0, "timed_out": False}
+
+    monkeypatch.setattr(test_runner_module, "run_command", fake_run_command)
+
+    run_tests(ws, sandboxed=True)
+
+    assert captured["command"].startswith("python -m pytest")
+    assert captured["sandboxed"] is True
+
+
+def test_not_sandboxed_still_pins_sys_executable(ws: Workspace, monkeypatch):
+    import sys
+
+    import agent.tools.test_runner as test_runner_module
+
+    captured: dict = {}
+
+    def fake_run_command(workspace, command, timeout=30, sandboxed=False, sandbox=None):
+        captured["command"] = command
+        return {"stdout": "1 passed in 0.01s", "stderr": "", "exit_code": 0, "timed_out": False}
+
+    monkeypatch.setattr(test_runner_module, "run_command", fake_run_command)
+
+    run_tests(ws, sandboxed=False)
+
+    assert captured["command"].startswith(f'"{sys.executable}" -m pytest')
+
+
+def test_an_open_sandbox_is_forwarded_to_run_command(ws: Workspace, monkeypatch):
+    import agent.tools.test_runner as test_runner_module
+
+    fake_sandbox = MagicMock()
+    captured: dict = {}
+
+    def fake_run_command(workspace, command, timeout=30, sandboxed=False, sandbox=None):
+        captured["sandbox"] = sandbox
+        return {"stdout": "1 passed in 0.01s", "stderr": "", "exit_code": 0, "timed_out": False}
+
+    monkeypatch.setattr(test_runner_module, "run_command", fake_run_command)
+
+    run_tests(ws, sandboxed=True, sandbox=fake_sandbox)
+
+    assert captured["sandbox"] is fake_sandbox
 
 
 def test_timeout_is_surfaced(calculator_ws: Workspace):

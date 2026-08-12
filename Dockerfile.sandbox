@@ -1,0 +1,35 @@
+# Dockerfile.sandbox
+#
+# M5: the disposable, non-root image every sandboxed shell command and test
+# run executes inside. A caller (agent/tools/sandbox.py's SandboxContainer)
+# mounts a workspace read-write at /workspace and execs into a container built
+# from this image, instead of running commands against the host directly.
+#
+# This image has NO network access at runtime. That is NOT enforced by
+# anything in this file -- an image build has no opinion on how a container
+# from it is later run. It is enforced by the Python SDK caller, which always
+# starts containers from this image with network_mode="none". Running
+# `docker run` against this image by hand, without --network none, has full
+# network access; do not rely on this Dockerfile alone for the isolation
+# guarantee.
+
+FROM python:3.11-slim
+
+# git: so a mounted checkout's history/diff commands work inside the sandbox.
+# pytest + pytest-cov: the project's test runner and its usual companion, so a
+# mounted repo can be tested without needing its own venv inside the container.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir pytest pytest-cov
+
+# Non-root: basic container security hygiene. A process escaping the
+# workspace mount still can't act as root inside its own container.
+RUN useradd --create-home --uid 1000 --shell /bin/bash sandbox
+USER sandbox
+
+WORKDIR /workspace
+
+# Overridden by SandboxContainer's own `command=` on every run; kept as a
+# sane default for anyone starting this image by hand.
+CMD ["sleep", "infinity"]

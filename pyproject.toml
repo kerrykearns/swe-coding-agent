@@ -4,7 +4,7 @@ testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra --strict-markers"
 markers = [
-    "integration: makes a real network call to the LLM provider (needs GROQ_API_KEY; deselect with -m 'not integration')",
+    "integration: exercises a real external system — the LLM provider (needs GROQ_API_KEY) or a real Docker daemon (needs Docker running); deselect with -m 'not integration'",
 ]
 # The fixture repos under demo/sample_repos are deliberately broken; they are
 # copied into tmp_path by the tests that need them and must never be collected

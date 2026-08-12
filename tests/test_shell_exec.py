@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from agent.tools import Workspace, run_command
 from agent.tools.shell_exec import _as_text
@@ -79,3 +80,59 @@ def test_multiline_output_preserved(ws: Workspace):
         "2",
         "3",
     ]
+
+
+# --------------------------------------------------------------------------
+# sandboxed dispatch (mocked SandboxContainer, no real Docker needed)
+# --------------------------------------------------------------------------
+
+
+def test_sandboxed_with_an_open_sandbox_runs_through_it_and_not_locally(ws: Workspace):
+    fake_sandbox = MagicMock()
+    fake_sandbox.run.return_value = {
+        "stdout": "from the sandbox",
+        "stderr": "",
+        "exit_code": 0,
+        "timed_out": False,
+    }
+
+    result = run_command(ws, "echo hi", timeout=5, sandboxed=True, sandbox=fake_sandbox)
+
+    fake_sandbox.run.assert_called_once_with("echo hi", timeout=5)
+    assert result["stdout"] == "from the sandbox"
+
+
+def test_sandboxed_without_a_sandbox_opens_and_closes_its_own(ws: Workspace, monkeypatch):
+    import agent.tools.shell_exec as shell_exec_module
+
+    fake_sandbox = MagicMock()
+    fake_sandbox.run.return_value = {
+        "stdout": "opened one just for this call",
+        "stderr": "",
+        "exit_code": 0,
+        "timed_out": False,
+    }
+    fake_sandbox.__enter__.return_value = fake_sandbox
+    fake_sandbox.__exit__.return_value = False
+
+    fake_container_cls = MagicMock(return_value=fake_sandbox)
+    monkeypatch.setattr(shell_exec_module, "SandboxContainer", fake_container_cls)
+
+    result = run_command(ws, "echo hi", sandboxed=True)
+
+    fake_container_cls.assert_called_once_with(ws)
+    fake_sandbox.__enter__.assert_called_once()
+    fake_sandbox.__exit__.assert_called_once()
+    assert result["stdout"] == "opened one just for this call"
+
+
+def test_not_sandboxed_never_touches_sandboxcontainer(ws: Workspace, monkeypatch):
+    import agent.tools.shell_exec as shell_exec_module
+
+    fake_container_cls = MagicMock(side_effect=AssertionError("should not be constructed"))
+    monkeypatch.setattr(shell_exec_module, "SandboxContainer", fake_container_cls)
+
+    result = run_command(ws, f"{PY} -c \"print('local')\"")
+
+    assert "local" in result["stdout"]
+    fake_container_cls.assert_not_called()

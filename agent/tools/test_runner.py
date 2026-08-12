@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import re
 import sys
+from typing import Optional
 
+from .sandbox import SandboxContainer
 from .shell_exec import run_command
 from .workspace import Workspace
 
@@ -29,18 +31,35 @@ _DURATION_RE = re.compile(r"\bin\s+[\d.]+\s*s")
 _TEST_OUTCOMES = ("passed", "failed", "error", "skipped", "xfailed", "xpassed")
 
 
-def run_tests(ws: Workspace, test_path: str = ".", timeout: int = 300) -> dict:
+def run_tests(
+    ws: Workspace,
+    test_path: str = ".",
+    timeout: int = 300,
+    sandboxed: bool = False,
+    sandbox: Optional[SandboxContainer] = None,
+) -> dict:
     """Run ``pytest {test_path} --tb=short -q`` in the workspace and parse it.
 
-    pytest is invoked as ``{sys.executable} -m pytest`` rather than a bare
-    ``pytest``: it is the same command, but it pins the run to the interpreter
-    we are already using instead of whatever happens to be on ``PATH``, which
-    matters when the workspace is a checkout with no activated virtualenv.
+    Outside of ``sandboxed=True``, pytest is invoked as
+    ``{sys.executable} -m pytest`` rather than a bare ``pytest``: it is the
+    same command, but it pins the run to the interpreter we are already using
+    instead of whatever happens to be on ``PATH``, which matters when the
+    workspace is a checkout with no activated virtualenv. When sandboxed,
+    ``sys.executable`` names the host interpreter, not one that exists inside
+    the container, so the sandbox image's own ``python`` is used instead —
+    the image's Dockerfile pins the version that runs there.
 
     Args:
-        ws: Workspace to run in; pytest's cwd is the workspace root.
+        ws: Workspace to run in; pytest's cwd is the workspace root (or, when
+            sandboxed, the directory mounted into the container).
         test_path: File or directory to test, relative to the workspace root.
         timeout: Seconds before the run is killed (test suites are slow).
+        sandboxed: Run pytest inside a Docker container with no network
+            access (see :mod:`agent.tools.sandbox`) instead of locally.
+        sandbox: An already-open
+            :class:`~agent.tools.sandbox.SandboxContainer` to run in. Only
+            meaningful when ``sandboxed`` is True; see
+            :func:`agent.tools.shell_exec.run_command` for when to pass one.
 
     Returns:
         A dict with:
@@ -53,8 +72,11 @@ def run_tests(ws: Workspace, test_path: str = ".", timeout: int = 300) -> dict:
         * ``raw_output`` — stdout and stderr, for showing the agent tracebacks.
         * ``exit_code`` / ``timed_out`` — the underlying process result.
     """
-    command = f'"{sys.executable}" -m pytest {test_path} --tb=short -q'
-    result = run_command(ws, command, timeout=timeout)
+    python_bin = "python" if sandboxed else f'"{sys.executable}"'
+    command = f"{python_bin} -m pytest {test_path} --tb=short -q"
+    result = run_command(
+        ws, command, timeout=timeout, sandboxed=sandboxed, sandbox=sandbox
+    )
 
     raw_output = result["stdout"]
     if result["stderr"]:

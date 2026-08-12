@@ -13,7 +13,7 @@ Measured against a single-shot baseline on a curated set of real issues.
 - [x] M4 — GitHub integration (fetch issue, clone, branch, commit locally).
       PR creation is written and tested but deliberately not wired in — it waits
       for M6's confirmation gate. Nothing in M4 pushes.
-- [ ] M5 — Docker sandboxing for all execution
+- [x] M5 — Docker sandboxing for all execution
 - [ ] M6 — Safety/refusal layer (risk classification + human confirmation)
 - [ ] M7 — Trajectory memory (Redis) + credit-assignment scoring
 - [ ] M8 — Evaluation harness (baseline vs full agent: success rate, avg turns,
@@ -306,6 +306,51 @@ its `final_success` meaningless. `workspaces/` is gitignored, and a test asks
 `git check-ignore` directly rather than trusting that, since what lands there is
 a full checkout of somebody else's repository including its own `.git`.
 
+### Sandboxing wraps `run_command`/`run_tests`; it does not add a new tool
+
+Decision: `agent/tools/sandbox.py` adds `SandboxContainer` and
+`build_sandbox_image`, and `shell_exec.run_command` / `test_runner.run_tests`
+each grow a `sandboxed: bool = False` parameter plus an optional
+already-open `sandbox` instance to run in. Both default to `False` and the
+local-subprocess path is untouched, so M1–M4's calls to these functions, and
+their tests, need no changes. A sandboxed `run_react_agent` opens exactly one
+`SandboxContainer` for the whole run — not one per turn — and threads it
+through `execute_tool` into every `run_tests` call, since starting a
+container per turn would make a sandboxed run far slower than an
+unsandboxed one for no isolation benefit (the workspace mount and
+`network_mode="none"` are properties of the container, set once at start).
+Rationale: M3 already scoped the agent's own toolset to
+`read_file`/`write_file`/`list_files`/`search_text`/`run_tests`/`get_diff` —
+no raw shell — specifically because nothing existed yet to confine a child
+process. M5 is that confinement, not a reason to widen the toolset; the
+agent still only ever executes pytest, now inside a network-isolated
+container instead of on the host.
+Tradeoff logged: `SandboxContainer.run()`'s timeout handling kills the exec'd
+PID directly (found via `exec_inspect`, killed with `kill -9` from a second
+exec) rather than tearing down the container, so one hung command doesn't
+cost the whole container and force a restart mid-run. If that alone doesn't
+unblock the reading thread within a grace period, the container is killed as
+a last resort — correct for a run about to be torn down anyway, but it means
+that `SandboxContainer` can't run anything else afterwards. Not observed in
+testing; logged because it is the one path that is hard to exercise
+deterministically without a command that resists `SIGKILL`.
+
+### The CLI default and the library default for `sandboxed` disagree, deliberately
+
+Decision: `run_on_issue()` itself defaults to `sandboxed=False`, matching
+every other tool-layer default — but `run_on_issue.py`'s CLI defaults its
+`--sandbox/--no-sandbox` flag to `True`. `react_agent.py`'s standalone CLI
+defaults `--sandbox` to `False`, matching its own library default.
+Rationale: `run_on_issue()` is called directly, without Docker mocked, by
+every M4 test — the first pass at this milestone gave the library function
+itself `sandboxed=True` by default, which broke all 25 of them the moment
+they ran without a reachable sandbox image. The policy call ("real cloned
+repos should sandbox by default") belongs at the CLI layer, which can afford
+an opinion about *why* it's being invoked; the library function underneath
+has no such context and should stay conservative so calling it — from tests,
+from `run_react_agent`, from anywhere — never silently starts requiring
+Docker.
+
 ## Current status
 M1 complete — tool layer built and tested (106 tests passing, 95% coverage on
 `agent.tools`).
@@ -371,4 +416,35 @@ Three things were learned from those live runs and are worth carrying into M8:
   paid tier or a run budget planned around this; it cannot be discovered while
   the harness is running.
 
-Next: M5, Docker sandboxing.
+M5 complete — Docker sandboxing (`Dockerfile.sandbox`, `agent/tools/sandbox.py`).
+28 new tests: 19 mocked-docker unit tests covering `SandboxContainer`'s
+lifecycle (start, run, timeout-kill, cleanup-on-exception) and
+`build_sandbox_image`'s build-once behaviour, plus 6 dispatch tests in
+`test_shell_exec.py`/`test_test_runner.py` for the new `sandboxed`/`sandbox`
+parameters — all offline, no Docker required. 436 tests passing offline out
+of 443 collected (7 marked `integration`: 4 carried over from M2–M4's live
+LLM/GitHub checks, 3 new ones below). Then those 3 real integration tests
+against an actual Docker daemon and the built `swe-agent-sandbox:latest`
+image, all passing in ~21s: a real
+command run and cleaned up (`docker` shows no leftover container), a real
+network call from inside the sandbox failing fast rather than hanging
+(`network_mode="none"` genuinely holds), and a real `sleep 60` killed within
+its 5s timeout rather than running to completion (the exec'd PID is killed
+directly, not the whole container — see the decision above).
+
+`run_react_agent` and `execute_tool` both gained a `sandboxed`/`sandbox`
+parameter that threads one `SandboxContainer` through every `run_tests` call
+in a run; `shell_exec.run_command` and `test_runner.run_tests` both gained
+matching `sandboxed`/`sandbox` parameters with `sandboxed=False` as the
+default everywhere in the tool layer, so the M1–M4 offline suite runs
+unmodified. `run_on_issue.py`'s CLI defaults `--sandbox` to `True`
+(real cloned repos); `react_agent.py`'s standalone CLI defaults it to
+`False` (local fixture iteration). One thing had to be caught and fixed
+before it reached the offline suite: giving `run_on_issue()` itself (not
+just its CLI) a default of `sandboxed=True` broke all 25 of its existing
+tests, which call it directly without a reachable Docker daemon — logged as
+a decision above, since the same mistake is easy to reintroduce in M6 or M7
+if a library function's default is used to express a policy that belongs at
+the CLI layer instead.
+
+Next: M6, the safety/refusal layer.

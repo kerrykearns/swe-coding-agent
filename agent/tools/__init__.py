@@ -16,6 +16,7 @@ Typical use::
 
 from .diff_tools import apply_patch, get_diff, get_status
 from .file_ops import list_files, read_file, search_text, write_file
+from .sandbox import SandboxContainer, SandboxError, build_sandbox_image
 from .shell_exec import run_command
 from .test_runner import run_tests
 from .workspace import Workspace, WorkspaceViolation
@@ -37,4 +38,8 @@ __all__ = [
     "get_diff",
     "get_status",
     "apply_patch",
+    # Docker sandboxing — see agent.tools.sandbox
+    "SandboxContainer",
+    "SandboxError",
+    "build_sandbox_image",
 ]
