@@ -262,4 +262,5 @@ workspaces/
 !eval/tasks/**/*.patch
 
 
-.hf_cache/.claude/
+.hf_cache/
+.claude/
