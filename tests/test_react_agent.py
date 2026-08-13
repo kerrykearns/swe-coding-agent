@@ -19,17 +19,20 @@ import pytest
 from openai import BadRequestError, OpenAI
 
 from agent.core import llm_client
+from agent.core import react_agent as react_agent_module
 from agent.core.prompts import load_prompt, placeholders, render_react_prompts
 from agent.core.react_agent import (
     FINISH_TOOL,
     MAX_INITIAL_LISTING,
     MAX_LISTED_FILES,
     MAX_LISTED_MATCHES,
+    MEMORY_SIMILARITY_THRESHOLD,
     TOOLS,
     StopReason,
     Trajectory,
     Turn,
     _initial_file_listing,
+    _memory_reference,
     _render_observation,
     _safe_diff,
     _truncate,
@@ -1237,6 +1240,170 @@ def test_the_final_panel_says_so_when_nothing_changed(captured_console):
     printed = captured_console.getvalue()
     assert "no changes were made" in printed
     assert "max_turns_reached" in printed
+
+
+# --------------------------------------------------------------------------
+# M7 memory wiring (agent.memory) — optional, off by default
+#
+# find_similar/save_trajectory are monkeypatched here rather than exercised
+# for real: their own ranking/persistence behaviour belongs to
+# tests/test_trajectory_store.py, and a real call would need a real (or
+# fakeredis) client plus the embedding model. These tests are only about
+# run_react_agent's wiring: does it call the right thing, with the right
+# arguments, only when memory_client is given.
+# --------------------------------------------------------------------------
+
+
+def _past_trajectory(
+    task_description: str = "fix add() so it returns the sum",
+    final_success: bool = True,
+    summary: str = "changed the operator in add() from - to +",
+) -> Trajectory:
+    """A finished trajectory, as if loaded back out of Redis."""
+    trajectory = Trajectory(
+        task_description=task_description,
+        final_success=final_success,
+        stop_reason=StopReason.TESTS_PASSED,
+        total_turns=2,
+        total_tokens=250,
+    )
+    trajectory.turns = [
+        Turn(turn_number=1, tool_name="write_file", tool_result={"ok": True}),
+        Turn(
+            turn_number=2,
+            tool_name=FINISH_TOOL,
+            tool_args={"success": final_success, "summary": summary},
+            tool_result={"ok": True},
+        ),
+    ]
+    return trajectory
+
+
+def test_memory_client_none_never_touches_memory(calculator_ws, monkeypatch):
+    """The default (no memory_client) must not call find_similar or save_trajectory."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        react_agent_module, "find_similar", lambda *a, **k: calls.append("find") or []
+    )
+    monkeypatch.setattr(
+        react_agent_module, "save_trajectory", lambda *a, **k: calls.append("save")
+    )
+
+    client = _scripted_client(
+        _reply("Stopping.", (_call(FINISH_TOOL, "c1", success=False, summary="n/a"),))
+    )
+    run_react_agent(calculator_ws, "fix add()", client=client)
+
+    assert calls == []
+
+
+def test_a_similar_past_trajectory_above_threshold_is_injected(calculator_ws, monkeypatch):
+    past = _past_trajectory()
+    monkeypatch.setattr(
+        react_agent_module, "find_similar", lambda *a, **k: [(past, 0.91)]
+    )
+    monkeypatch.setattr(react_agent_module, "save_trajectory", lambda *a, **k: None)
+
+    seen_matches: list[tuple] = []
+    client = _scripted_client(
+        _reply("Stopping.", (_call(FINISH_TOOL, "c1", success=False, summary="n/a"),))
+    )
+    run_react_agent(
+        calculator_ws,
+        "fix add()",
+        client=client,
+        memory_client=object(),
+        on_memory_match=lambda traj, sim: seen_matches.append((traj, sim)),
+    )
+
+    system, memory_system, user = _requests(client)[0]["messages"]
+    assert system["role"] == "system"
+    assert memory_system["role"] == "system"
+    assert "similar past task was attempted before" in memory_system["content"]
+    assert "0.91" in memory_system["content"]
+    assert "changed the operator in add()" in memory_system["content"]
+    assert user["role"] == "user"
+
+    assert seen_matches == [(past, 0.91)]
+
+
+def test_a_match_below_threshold_is_not_injected(calculator_ws, monkeypatch):
+    below = MEMORY_SIMILARITY_THRESHOLD - 0.01
+    monkeypatch.setattr(
+        react_agent_module, "find_similar", lambda *a, **k: [(_past_trajectory(), below)]
+    )
+    monkeypatch.setattr(react_agent_module, "save_trajectory", lambda *a, **k: None)
+
+    calls: list[tuple] = []
+    client = _scripted_client(
+        _reply("Stopping.", (_call(FINISH_TOOL, "c1", success=False, summary="n/a"),))
+    )
+    run_react_agent(
+        calculator_ws,
+        "fix add()",
+        client=client,
+        memory_client=object(),
+        on_memory_match=lambda traj, sim: calls.append((traj, sim)),
+    )
+
+    assert len(_requests(client)[0]["messages"]) == 2  # system, user — no memory message
+    assert calls == []
+
+
+def test_no_stored_trajectories_injects_nothing(calculator_ws, monkeypatch):
+    monkeypatch.setattr(react_agent_module, "find_similar", lambda *a, **k: [])
+    monkeypatch.setattr(react_agent_module, "save_trajectory", lambda *a, **k: None)
+
+    client = _scripted_client(
+        _reply("Stopping.", (_call(FINISH_TOOL, "c1", success=False, summary="n/a"),))
+    )
+    run_react_agent(calculator_ws, "fix add()", client=client, memory_client=object())
+
+    assert len(_requests(client)[0]["messages"]) == 2
+
+
+def test_the_finished_trajectory_is_saved_when_memory_client_is_given(
+    calculator_ws, monkeypatch
+):
+    monkeypatch.setattr(react_agent_module, "find_similar", lambda *a, **k: [])
+    saved: list = []
+    monkeypatch.setattr(
+        react_agent_module,
+        "save_trajectory",
+        lambda client, trajectory, turn_scores=None: saved.append(
+            (client, trajectory, turn_scores)
+        ),
+    )
+
+    sentinel_client = object()
+    client = _scripted_client(
+        _reply("Stopping.", (_call(FINISH_TOOL, "c1", success=False, summary="n/a"),))
+    )
+    trajectory = run_react_agent(
+        calculator_ws, "fix add()", client=client, memory_client=sentinel_client
+    )
+
+    assert len(saved) == 1
+    saved_client, saved_trajectory, turn_scores = saved[0]
+    assert saved_client is sentinel_client
+    assert saved_trajectory is trajectory
+    assert turn_scores is not None
+    assert len(turn_scores) == trajectory.total_turns
+
+
+def test_memory_reference_reports_outcome_and_the_past_runs_own_summary():
+    text = _memory_reference(_past_trajectory(final_success=True), 0.83)
+    assert "0.83" in text
+    assert "succeeded" in text
+    assert "changed the operator in add()" in text
+    assert "background from a different run" in text
+
+
+def test_memory_reference_says_so_when_the_past_run_never_finished():
+    past = _past_trajectory()
+    past.turns = [Turn(turn_number=1, tool_name="read_file", tool_result={"ok": True})]
+    text = _memory_reference(past, 0.8)
+    assert "What was done" not in text
 
 
 # --------------------------------------------------------------------------

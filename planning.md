@@ -15,7 +15,7 @@ Measured against a single-shot baseline on a curated set of real issues.
       for M6's confirmation gate. Nothing in M4 pushes.
 - [x] M5 — Docker sandboxing for all execution
 - [x] M6 — Safety/refusal layer (risk classification + human confirmation)
-- [ ] M7 — Trajectory memory (Redis) + credit-assignment scoring
+- [x] M7 — Trajectory memory (Redis) + credit-assignment scoring
 - [ ] M8 — Evaluation harness (baseline vs full agent: success rate, avg turns,
       token cost) on curated local dummy repos with known failing tests
 - [ ] M9 — Live demo (CLI/web) + real GitHub issue showcase + README polish
@@ -422,6 +422,108 @@ configured) or require re-adding one to the stored remote, undoing that
 work. Passing the URL directly to the one `git push` call keeps the token
 in memory only, for exactly as long as that one command runs.
 
+### Credit assignment is a heuristic over checkpoints, not a reward model
+
+Decision: `agent/memory/credit_assignment.score_trajectory` scores each turn
+using only the trajectory's own `run_tests` observations as checkpoints —
++1/-1/0 for the turns between two consecutive valid checkpoints, depending on
+whether the failure count (`failed + errors`) went down, up, or stayed flat;
+0 for every `run_tests` turn itself (read-only, regardless of whether that
+particular call produced a valid checkpoint); 0 for every turn before the
+first checkpoint or after the last one (never checked by a later test run).
+The module docstring says explicitly that this is not RL and not a trained
+reward model.
+Rationale: the whole point is a signal that is auditable by reading the code,
+not one that requires trusting a model. A live scoring pass against the M7
+demo run's own trajectory (write → run_tests failing → three more writes →
+never re-ran tests, `max_turns_reached`) is what caught a design gap the hand-
+written tests alone had not: an early version only marked *valid* checkpoints
+as read-only, so a `run_tests` call that failed for tool reasons (bad
+`test_path`, not a real checkpoint) got scored as if it were an ordinary
+code-changing action sitting between two real checkpoints — nonsensical,
+since it never touched any file. Fixed so every turn whose `tool_name` is
+`"run_tests"` is excluded from the between-checkpoints scoring pass, valid
+checkpoint or not.
+
+### The memory reference is an extra system message, not a template placeholder
+
+Decision: when `run_react_agent`'s optional `memory_client` finds a match
+above `MEMORY_SIMILARITY_THRESHOLD` (0.75), the summary
+(`agent.core.react_agent._memory_reference`) is appended as its own
+`{"role": "system", ...}` message, inserted between the loaded system prompt
+and the first user message — `configs/prompts/react_system.md` itself takes
+no new placeholder. Existing calls with `memory_client=None` (the default)
+build exactly two messages, byte-for-byte the M1-M6 shape; a test
+(`test_the_first_request_carries_the_prompts_the_tools_and_the_file_listing`)
+already pins that count and needed no change.
+Rationale: prompt templates are supposed to be reviewable as prompt edits
+(see the M2 decision on prompts living on disk) — a retrieved memory is
+per-run data, not a template change, so it does not belong baked into the
+`.md` file. 0.75 itself is picked, not tuned: all-MiniLM-L6-v2 puts
+paraphrases of the same task comfortably above 0.85-0.9 and unrelated tasks
+under 0.5 in informal checks, so 0.75 favours precision (skip a weak match
+entirely) over recall, since the model has no way to tell a strong match from
+a noisy one once either is sitting in its context. The live demo below
+reproduced a paraphrase landing at 0.76 — just above the line — which is
+about as direct a validation of the threshold as a single run can give
+without a proper eval set; M8 is where that gets checked properly.
+Only the past run's own `finish()` summary is included, never full turns —
+turns are token-expensive (file contents, raw pytest tracebacks) and the
+model is told explicitly that this is "background from a different run" it
+must still verify itself, not a shortcut to skip verification.
+
+### `find_similar` is a linear scan on purpose, not a missing vector index
+
+Decision: `agent/memory/trajectory_store.find_similar` embeds the query once
+and then reads every key under `trajectory:*` with `scan_iter`, scoring each
+against the query with cosine similarity computed in plain Python — no
+vector database, no approximate-nearest-neighbour index.
+Rationale: this project stores one trajectory per run. Even heavy use is
+dozens to low hundreds of stored trajectories, and a linear scan over a few
+hundred 384-dimensional vectors costs well under a millisecond of real work.
+A vector DB would be a second service to keep running alongside Redis and
+code to maintain an index that, at this scale, buys nothing a Python loop
+does not already do. The reasoning is repeated as a comment in the module
+itself so it survives independent of this log.
+
+### Memory storage never creates an import cycle with the ReAct loop
+
+Decision: `agent/memory/credit_assignment.py` and
+`agent/memory/trajectory_store.py` only reference
+`agent.core.react_agent.Trajectory` under `TYPE_CHECKING` at module scope;
+the one place a real `Trajectory` class object is needed at runtime
+(`load_trajectory`/`find_similar` reconstructing one from stored JSON) is a
+deferred `from ..core.react_agent import Trajectory` inside the function
+body. `agent/core/react_agent.py` itself imports `agent.memory` normally, at
+module scope — the same pattern M6 used for `agent.safety.ConfirmationGate`.
+Rationale: `agent.memory` never needs `agent.core.react_agent` to be
+importable in order to import successfully, so there is nothing to cycle
+against regardless of which module imports which first. That made the
+`memory_client=None` default genuinely free: no lazy-import gymnastics were
+needed in `react_agent.py` to keep M1-M6 callers working, because importing
+`agent.memory` only costs `redis` and `pydantic` — already hard dependencies
+— never `sentence-transformers`, which stays behind a lazy import inside
+`agent/memory/embeddings._get_model()` and is only ever touched if
+`embed_text` is actually called.
+
+### A Windows/Docker Desktop `localhost` quirk, logged so it isn't relearned
+
+Decision: none needed in the code — `agent/memory/redis_client.py` still
+defaults to `REDIS_HOST=localhost`, matching `.env.example`. Logged here
+because it cost real debugging time and belongs with M3's Groq/newline
+findings as "a backend property of this environment, not a bug in our code".
+On this Windows machine, `redis-py` connecting to Docker Desktop's published
+Redis port via the hostname `localhost` completed the TCP handshake (`Test-
+NetConnection` reported success) but then had the connection reset
+mid-read (`WinError 10053/10054`) on every attempt, in both the Bash and
+PowerShell tool — while a raw socket PING and `redis-py` both worked
+immediately against `127.0.0.1`. This points at IPv6 (`::1`) loopback
+forwarding through Docker Desktop's WSL2 network proxy being the flaky path,
+with `localhost` resolving there first. `REDIS_HOST=127.0.0.1` is the
+practical workaround for local dev on a machine with this quirk; nothing in
+the product needed to change, since a real deployment target is unlikely to
+share this specific Windows/WSL2/Docker Desktop combination.
+
 ## Current status
 M1 complete — tool layer built and tested (106 tests passing, 95% coverage on
 `agent.tools`).
@@ -550,3 +652,41 @@ prompt produced a denied `write_file` observation, and the agent's next turn
 visibly reacted to the denial instead of the run crashing.
 
 Next: M7, trajectory memory (Redis) and credit-assignment scoring.
+
+M7 complete — trajectory memory and credit-assignment scoring
+(`agent/memory/redis_client.py`, `embeddings.py`, `trajectory_store.py`,
+`credit_assignment.py`), plus optional `memory_client`/`on_memory_match`
+wiring in `react_agent.run_react_agent` and a `--memory/--no-memory` CLI flag.
+37 new offline tests (557 passing offline, up from 520, 0 failing) plus 2 new
+`@pytest.mark.integration` tests against a real Redis, for 9 integration
+tests project-wide. `fakeredis` backs every offline trajectory_store test;
+`sentence-transformers`' all-MiniLM-L6-v2 is used for real everywhere
+embeddings are exercised, since there is nothing meaningful to fake about
+"does cosine similarity rank these correctly" — see the design decisions
+above for the model-load and Windows/Docker-Desktop quirks that surfaced
+while getting that model loading reliably in this environment.
+
+`memory_client=None` remains the default everywhere (library function and
+CLI both — unlike sandboxing/confirmation, there is no default-disagreement
+decision to make here, since a CLI cannot reasonably default to *on* a piece
+of optional infrastructure, Redis, that it cannot assume is running); every
+M1-M6 test needed no changes, and the CLI's own memory flag defaults off for
+the same reason `--sandbox` does.
+
+Verified end to end against the calculator fixture, run twice through
+`python -m agent.core.react_agent --memory`: the first run (task: "fix add()
+so it returns the correct sum instead of subtracting") found nothing in an
+empty Redis, fixed the bug in 4 turns, and saved its scored trajectory. The
+second run, on a fresh independent copy of the same buggy repo with a
+paraphrased task ("the add() function in the calculator is broken, it
+subtracts instead of adding, please fix it"), printed a "memory match
+found" panel showing the first run's task, outcome, and turn count at
+similarity 0.76 — above the 0.75 threshold — genuinely injected into the
+conversation before turn 1, not merely asserted in a test. The second run
+itself then spent two turns on Groq's malformed-tool-call rejection (M3's
+already-logged backend property) and ran out of its 8-turn budget without
+calling `run_tests`, landing on `max_turns_reached` — a real live-model
+outcome, left as-is rather than tuned away, since a memory demo is not the
+place to paper over how noisy a live run already is.
+
+Next: M8, the evaluation harness.

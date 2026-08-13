@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./.venv/Scripts/python -c ' *)",
+      "Bash(REDIS_HOST=127.0.0.1 HF_HOME=\"C:\\\\\\\\hfcache\" ./.venv/Scripts/python -m pytest tests/test_trajectory_store.py -v -m integration)",
+      "Bash(REDIS_HOST=127.0.0.1 REDIS_PORT=1 HF_HOME=\"C:\\\\\\\\hfcache\" ./.venv/Scripts/python -m pytest tests/test_trajectory_store.py -v -m integration)",
+      "Bash(REDIS_HOST=127.0.0.1 ./.venv/Scripts/python -c ' *)"
+    ]
+  }
+}

@@ -44,6 +44,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
+from ..memory import find_similar, get_redis_client, save_trajectory, score_trajectory
 from ..safety import ConfirmationGate
 from ..tools import (
     SandboxContainer,
@@ -92,6 +93,16 @@ MAX_TEST_OUTPUT_LINES = 40
 
 #: Files listed in the opening user message.
 MAX_INITIAL_LISTING = 200
+
+#: Minimum cosine similarity (see agent.memory.embeddings) for an M7 memory
+#: match to be worth referencing. Picked as a conservative middle value, not
+#: tuned against real usage data: all-MiniLM-L6-v2 puts near-duplicate task
+#: descriptions (the same bug described in different words) comfortably above
+#: 0.85-0.9, and unrelated tasks well under 0.5. 0.75 favours precision over
+#: recall — a weak, possibly-misleading "similar" match is worse than no match
+#: at all, since the model has no way to tell a strong match from a noisy one
+#: once it is sitting in context. Revisit if M8 shows this is mistuned.
+MEMORY_SIMILARITY_THRESHOLD = 0.75
 
 
 # --------------------------------------------------------------------------
@@ -614,6 +625,41 @@ def _initial_file_listing(workspace: Workspace) -> str:
     return listing
 
 
+def _memory_reference(past: Trajectory, similarity: float) -> str:
+    """A short, structured summary of a similar past run, for the system context.
+
+    Deliberately NOT the full trajectory: a past run's turns are token-expensive
+    and mostly noise (file contents, raw pytest output) for a model that just
+    needs "has something like this been attempted before, and did it work". If
+    the past run called ``finish``, its own one-or-two-sentence summary is the
+    single most useful extra fact; a run that never called ``finish`` has none,
+    and the note says so rather than inventing one.
+    """
+    finish_turn = next(
+        (turn for turn in reversed(past.turns) if turn.tool_name == FINISH_TOOL), None
+    )
+    what_was_done = (
+        finish_turn.tool_args.get("summary", "").strip() if finish_turn else ""
+    )
+    past_task = past.task_description.strip()
+    if len(past_task) > 200:
+        past_task = past_task[:200] + "…"
+
+    lines = [
+        f"Reference: a similar past task was attempted before (similarity {similarity:.2f}):",
+        f'- Past task: "{past_task}"',
+        f"- Outcome: {'succeeded' if past.final_success else 'did not succeed'}, "
+        f"in {past.total_turns} turns (stopped: {past.stop_reason.value}).",
+    ]
+    if what_was_done:
+        lines.append(f"- What was done: {what_was_done}")
+    lines.append(
+        "This is background from a different run, not this one. Verify "
+        "everything yourself with the tools rather than assuming it applies here."
+    )
+    return "\n".join(lines)
+
+
 def _assistant_message(content: str, call: dict) -> dict:
     """Build the assistant history entry for the one tool call we executed.
 
@@ -652,6 +698,8 @@ def run_react_agent(
     on_turn: Optional[Callable[[Turn], None]] = None,
     sandboxed: bool = False,
     confirmation_gate: Optional[ConfirmationGate] = None,
+    memory_client=None,
+    on_memory_match: Optional[Callable[[Trajectory, float], None]] = None,
 ) -> Trajectory:
     """Work on ``task_description`` in ``workspace``, one tool action per turn.
 
@@ -683,6 +731,23 @@ def run_react_agent(
             this project (see the sandboxing default-disagreement decision
             in planning.md); the CLI below opts into a real, interactive
             gate by default instead.
+        memory_client: M7's trajectory memory (see :mod:`agent.memory`) — a
+            connected Redis client (or a :class:`fakeredis.FakeRedis` in
+            tests). ``None`` (the default) skips memory entirely: no
+            retrieval before the run, nothing saved after it, byte-for-byte
+            the M1-M6 behaviour. When given, before turn 1 the most similar
+            past trajectory (by cosine similarity of embedded
+            ``task_description``) is looked up; if its similarity is at least
+            :data:`MEMORY_SIMILARITY_THRESHOLD`, a short structured summary of
+            that past run — never the full trajectory, which is
+            token-expensive and mostly noise — is injected as an extra system
+            message. After the run completes, the new trajectory is scored
+            with :func:`agent.memory.credit_assignment.score_trajectory` and
+            saved, so later runs can retrieve it in turn.
+        on_memory_match: Called with ``(past_trajectory, similarity)`` when a
+            memory match is injected, mainly so a caller (e.g. the CLI below)
+            can show what was retrieved. Never called if ``memory_client`` is
+            ``None`` or nothing similar enough was found.
 
     Returns:
         A :class:`Trajectory`. The run stops when the agent calls ``finish``,
@@ -702,10 +767,19 @@ def run_react_agent(
         task_description=task_description,
         file_listing=_initial_file_listing(workspace),
     )
-    messages: list[dict] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+
+    if memory_client is not None:
+        matches = find_similar(memory_client, task_description, k=1)
+        if matches and matches[0][1] >= MEMORY_SIMILARITY_THRESHOLD:
+            past_trajectory, similarity = matches[0]
+            messages.append(
+                {"role": "system", "content": _memory_reference(past_trajectory, similarity)}
+            )
+            if on_memory_match is not None:
+                on_memory_match(past_trajectory, similarity)
+
+    messages.append({"role": "user", "content": user_prompt})
 
     if client is None:
         client = llm_client.get_client()
@@ -852,6 +926,10 @@ def run_react_agent(
     trajectory.final_diff = _safe_diff(workspace)
     trajectory.total_turns = len(trajectory.turns)
     trajectory.total_tokens = sum(turn.tokens_used for turn in trajectory.turns)
+
+    if memory_client is not None:
+        save_trajectory(memory_client, trajectory, turn_scores=score_trajectory(trajectory))
+
     return trajectory
 
 
@@ -910,6 +988,16 @@ def main(
             "ungated, matching every milestone before M6."
         ),
     ),
+    memory: bool = typer.Option(
+        False,
+        "--memory/--no-memory",
+        help=(
+            "Retrieve a similar past trajectory from Redis (M7) before "
+            "starting, and save this run's trajectory afterwards. Off by "
+            "default, since it requires a reachable Redis (see REDIS_HOST / "
+            "REDIS_PORT in .env) — every milestone before M7 has no memory."
+        ),
+    ),
 ) -> None:
     """Iterate — act, observe, adjust — until the tests pass or the turns run out."""
     try:
@@ -925,13 +1013,15 @@ def main(
             f"[bold]model[/bold]     {model or llm_client.get_model()}\n"
             f"[bold]max turns[/bold] {max_turns}\n"
             f"[bold]sandbox[/bold]   {sandbox}\n"
-            f"[bold]confirm[/bold]   {confirm}",
+            f"[bold]confirm[/bold]   {confirm}\n"
+            f"[bold]memory[/bold]    {memory}",
             title="ReAct agent",
             border_style="cyan",
         )
     )
 
     gate = ConfirmationGate() if confirm else None
+    memory_client = get_redis_client() if memory else None
 
     try:
         trajectory = run_react_agent(
@@ -942,6 +1032,8 @@ def main(
             on_turn=_print_turn,
             sandboxed=sandbox,
             confirmation_gate=gate,
+            memory_client=memory_client,
+            on_memory_match=_print_memory_match,
         )
     except llm_client.LLMConfigError as exc:
         console.print(f"[bold red]Configuration error:[/bold red] {exc}")
@@ -952,6 +1044,17 @@ def main(
 
     _print_final(trajectory, show_diff=show_diff)
     raise typer.Exit(code=0 if trajectory.final_success else 1)
+
+
+def _print_memory_match(past_trajectory: Trajectory, similarity: float) -> None:
+    """Print the M7 memory reference injected into this run's system context."""
+    console.print(
+        Panel(
+            _memory_reference(past_trajectory, similarity),
+            title="memory match found — injected into system context",
+            border_style="magenta",
+        )
+    )
 
 
 def _print_turn(turn: Turn) -> None:

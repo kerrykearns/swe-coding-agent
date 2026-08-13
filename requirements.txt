@@ -20,6 +20,13 @@ docker==7.2.0
 
 # --- Trajectory memory ---
 redis>=6.4.0,<7.2.1
+# fakeredis backs the default (offline) test suite for agent/memory — no real
+# Redis needed to run `pytest tests/ -m "not integration"`.
+fakeredis>=2.30.0
+# Local embedding model for trajectory similarity search (M7). Free, no API
+# key, runs on CPU. Downloads its weights from Hugging Face Hub on first use
+# (see agent/memory/embeddings.py for the offline/timeout handling of that).
+sentence-transformers>=3.0.0
 
 # --- Config / secrets ---
 python-dotenv==1.2.2

@@ -260,3 +260,6 @@ workspaces/
 *.patch
 *.diff
 !eval/tasks/**/*.patch
+
+
+.hf_cache/.claude/
