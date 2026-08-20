@@ -1,12 +1,14 @@
 # SWE Coding Agent — Project Plan
 
+**Project complete** — M0–M9 all shipped: a safety-gated, sandboxed, multi-turn coding agent that beats a single-shot baseline on hard multi-defect tasks (100% vs 75%) at ~18x token cost, with GitHub issue-to-PR automation demonstrated end to end.
+
 ## Goal
 Multi-turn ReAct-style coding agent: accepts a GitHub issue or natural-language
 task, plans steps, edits files, runs tests/shell commands, and submits a patch.
 Measured against a single-shot baseline on a curated set of real issues.
 
 ## Milestones
-- [ ] M0 — Repo & environment scaffolding
+- [x] M0 — Repo & environment scaffolding
 - [x] M1 — Tool layer (file ops, shell exec, patch/diff, test runner) — no LLM yet
 - [x] M2 — Core ReAct loop, single-shot baseline agent
 - [x] M3 — Multi-turn ReAct planning loop with stopping conditions
@@ -16,9 +18,9 @@ Measured against a single-shot baseline on a curated set of real issues.
 - [x] M5 — Docker sandboxing for all execution
 - [x] M6 — Safety/refusal layer (risk classification + human confirmation)
 - [x] M7 — Trajectory memory (Redis) + credit-assignment scoring
-- [ ] M8 — Evaluation harness (baseline vs full agent: success rate, avg turns,
+- [x] M8 — Evaluation harness (baseline vs full agent: success rate, avg turns,
       token cost) on curated local dummy repos with known failing tests
-- [ ] M9 — Live demo (CLI/web) + real GitHub issue showcase + README polish
+- [x] M9 — Live demo (CLI/web) + real GitHub issue showcase + README polish
 
 ## Design decisions log
 (append here as we make choices, with date and rationale)
@@ -689,4 +691,57 @@ calling `run_tests`, landing on `max_turns_reached` — a real live-model
 outcome, left as-is rather than tuned away, since a memory demo is not the
 place to paper over how noisy a live run already is.
 
-Next: M8, the evaluation harness.
+M8 complete — the evaluation harness (`eval/harness.py`, `eval/run_eval.py`,
+`eval/report.py`) and a 10-task, three-tier task set (`eval/tasks/*.yaml`):
+trivial (3), medium (3), hard (4) — hard tasks each seed two independent
+defects in one function, rather than one bug alone. 584 tests passing (up
+from 557). Every `EvalResult.success` is decided the way the module
+docstring insists on: an independent re-run of the task's own
+`verify_command` against the final workspace, never the baseline's own
+`success` or the ReAct loop's `final_success` — the "verified, not claimed"
+principle applied one layer up.
+
+The full 10-task x 2-condition matrix, run against Groq and saved
+incrementally to `eval/results/*.json`, aggregates (via `eval/report.py`)
+to: baseline 90% (9/10), react 100% (10/10) overall. By difficulty, both
+conditions tie at 100% on trivial and medium, and diverge on hard —
+baseline 75% (3/4), react 100% (4/4) — at a cost of ~18.3x the tokens and
+~36x the wall-clock time per task for react. The hard tier is where the
+comparison earns its design: every hard task hides two independent
+defects, and every react win over baseline on that tier came from
+catching a secondary defect (e.g. missing input validation) that
+baseline's one-shot fix left unaddressed while still fixing the primary
+bug. Full numbers in `eval/results/report.md`.
+
+Two things surfaced while getting this matrix to actually complete:
+
+* **Groq deprecated `llama-3.3-70b-versatile` mid-eval.** The model that
+  had been the project's default since the "LLM Backend — Groq" decision
+  logged above stopped being served partway through the M8 run. Because
+  the model is read from `GROQ_MODEL`/`--model` at call time rather than hard-coded,
+  the fix was pointing the environment variable at `openai/gpt-oss-120b`
+  and re-running — no code changed.
+* **A rate-limit propagation bug, found by the matrix itself.**
+  `run_react_agent`'s per-turn loop caught every LLM-call exception,
+  including `openai.RateLimitError`, in one generic `except Exception` and
+  recorded it as an ordinary failed turn — correct for a malformed tool
+  call, wrong for a 429: every subsequent call in the run, and every
+  subsequent task in the matrix, was going to hit the same exhausted
+  quota, so recording it as one task's failure meant
+  `eval.run_eval.run_matrix` would burn through the rest of the matrix
+  rediscovering the same rate limit one task at a time instead of
+  stopping cleanly. Fixed with a `RateLimitError`-specific `except`
+  clause, ordered before the catch-all, that re-raises so the error
+  reaches `eval.harness.run_task` (which deliberately does not swallow
+  it either — see its docstring) and then `run_matrix`, which now stops
+  the whole run and reports how many combinations completed before the
+  limit hit.
+
+A separate, later finding — a live diff-syntax-corruption failure during
+the M9 demo run, where the model wrote diff-hunk markers into a source
+file's content instead of plain Python — is recorded as its own M9
+finding, not folded in here: it is a different code path (malformed
+`write_file` content, not an LLM-call exception) and a different cause
+(non-deterministic model output, not a provider-side account change).
+
+Next: M9, the live demo and README polish.
