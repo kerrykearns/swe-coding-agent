@@ -38,6 +38,7 @@ from typing import Annotated, Any, Callable, Optional
 
 import typer
 from agent_framework import FunctionTool
+from openai import RateLimitError
 from pydantic import BaseModel, Field, ValidationError
 from rich.console import Console
 from rich.panel import Panel
@@ -757,8 +758,10 @@ def run_react_agent(
 
     Raises:
         LLMConfigError: If no client was passed and ``GROQ_API_KEY`` is unset.
-            Everything that can go wrong *after* the first call is recorded in
-            the trajectory instead of raised.
+        openai.RateLimitError: Propagated rather than recorded — see
+            :func:`eval.harness.run_task`'s docstring for why. Everything else
+            that can go wrong *after* the first call is recorded in the
+            trajectory instead of raised.
     """
     if max_turns < 1:
         raise ValueError(f"max_turns must be at least 1, got {max_turns}")
@@ -805,6 +808,14 @@ def run_react_agent(
                 reply = llm_client.chat_with_tools(
                     client, messages, tools=schemas, model=model
                 )
+            except RateLimitError:
+                # Not this turn's failure, and not this run's either — every
+                # subsequent call will hit the same exhausted quota, so this
+                # must propagate all the way to eval.run_eval.run_matrix,
+                # which stops the whole matrix rather than burning through
+                # the rest of the tasks re-discovering the same 429. See
+                # eval.harness.run_task's docstring for the full contract.
+                raise
             except Exception as exc:  # noqa: BLE001 - recorded, not raised
                 attempted = llm_client.malformed_tool_call(exc)
                 if attempted is None:

@@ -22,10 +22,12 @@ from agent.tools.test_runner import _parse_counts
 
 def test_detects_the_calculator_bug(calculator_ws: Workspace):
     result = run_tests(calculator_ws)
-    assert result["failed"] == 1
+    # 13 of the fixture's 14 tests fail — every function but subtract() ships
+    # with a deliberate bug; see demo/sample_repos/calculator/calculator/calc.py.
+    assert result["failed"] == 13
     assert result["passed"] == 1
     assert result["errors"] == 0
-    assert result["total"] == 2
+    assert result["total"] == 14
     assert result["success"] is False
     assert result["timed_out"] is False
     assert "test_add" in result["raw_output"]
@@ -33,21 +35,19 @@ def test_detects_the_calculator_bug(calculator_ws: Workspace):
 
 def test_scoped_to_a_single_test_file(calculator_ws: Workspace):
     result = run_tests(calculator_ws, "calculator/test_calc.py")
-    assert result["failed"] == 1
+    assert result["failed"] == 13
     assert result["passed"] == 1
 
 
 def test_reports_success_once_the_bug_is_fixed(calculator_ws: Workspace):
     """Same fixture, patched in the tmp copy: the parser must flip to success."""
-    write_file(
-        calculator_ws,
-        "calculator/calc.py",
-        "def add(a, b):\n    return a + b\n\n\ndef subtract(a, b):\n    return a - b\n",
-    )
+    from .test_baseline import _ALL_BUGS_FIXED_CALC
+
+    write_file(calculator_ws, "calculator/calc.py", _ALL_BUGS_FIXED_CALC)
     result = run_tests(calculator_ws)
-    assert result["passed"] == 2
+    assert result["passed"] == 14
     assert result["failed"] == 0
-    assert result["total"] == 2
+    assert result["total"] == 14
     assert result["success"] is True
     assert result["exit_code"] == 0
 

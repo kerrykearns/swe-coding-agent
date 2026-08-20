@@ -1,0 +1,12 @@
+id: add_wrong_sum
+title: "add() gives the wrong result"
+description: |
+  add(2, 3) returns -1 instead of 5.
+
+  Tried a few other inputs too — add(10, 4) returns 6 instead of 14. Every
+  result I get out of the calculator's addition is wrong. Basic subtraction
+  seems fine though.
+fixture_repo: demo/sample_repos/calculator
+target_file: calculator/calc.py
+verify_command: "pytest calculator/test_calc.py::test_add -v"
+difficulty: trivial

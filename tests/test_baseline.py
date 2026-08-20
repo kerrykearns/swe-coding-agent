@@ -27,6 +27,203 @@ from agent.tools import Workspace, read_file
 
 FIXED_CALC = "def add(a, b):\n    return a + b\n"
 
+#: The full fixture file with every one of its ten deliberate bugs fixed —
+#: needed because test_calc.py imports every function by name at module
+#: scope, so any scripted "model reply" that write_file() writes back must
+#: define all of them or the whole test module fails to collect, not just the
+#: tests for whatever wasn't touched. Mirrors test_react_agent.FIXED_CALC.
+_ALL_BUGS_FIXED_CALC = '''"""A deliberately broken calculator, used as an agent fixture and M8's
+evaluation task set.
+
+Every public function below has exactly one self-contained, deliberately
+introduced bug (two, for divide(), average(), and factorial()), each
+independently detectable by its own test in test_calc.py. Fixing one
+function's bug never requires touching another function's code, so each is
+usable as its own isolated eval task.
+
+The bug in add() is intentional: test_calc.py fails against this file, which
+gives the agent (and the tool-layer tests) something real to detect and fix.
+"""
+
+
+def add(a, b):
+    """Return the sum of a and b."""
+    return a + b
+
+
+def subtract(a, b):
+    """Return a minus b."""
+    return a - b
+
+
+def modulo(a, b):
+    """Return the remainder of a divided by b."""
+    return a % b
+
+
+def square(x):
+    """Return x squared."""
+    return x * x
+
+
+def max_value(numbers):
+    """Return the largest number in the list."""
+    result = numbers[0]
+    for n in numbers[1:]:
+        if n > result:
+            result = n
+    return result
+
+
+def _clean(s):
+    """Strip spaces so is_palindrome can compare characters directly."""
+    return s.replace(" ", "").lower()
+
+
+def is_palindrome(s):
+    """Return True if s reads the same forwards and backwards."""
+    cleaned = _clean(s)
+    return cleaned == cleaned[::-1]
+
+
+def fibonacci(n):
+    """Return the nth Fibonacci number (0-indexed: fibonacci(0) == 0)."""
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+
+def divide(a, b):
+    """Return a divided by b."""
+    if b == 0:
+        raise ValueError("Cannot divide by zero")
+    return a / b
+
+
+def average(numbers):
+    """Return the arithmetic mean of numbers."""
+    if not numbers:
+        raise ValueError("average of empty list")
+    return sum(numbers) / len(numbers)
+
+
+def is_prime(n):
+    """Return True if n is a prime number, False otherwise."""
+    if n < 2:
+        return False
+    for i in range(2, int(n ** 0.5) + 1):
+        if n % i == 0:
+            return False
+    return True
+
+
+def factorial(n):
+    """Return n! (n factorial)."""
+    if n < 0:
+        raise ValueError("factorial is not defined for negative numbers")
+    result = 1
+    for i in range(1, n + 1):
+        result *= i
+    return result
+'''
+
+#: The full fixture file with add() edited to a *different* wrong operator,
+#: and every other function left exactly as buggy as the shipped fixture —
+#: for the "still broken" scenario, which must still define every name
+#: test_calc.py imports, but is not claiming to have fixed anything else.
+_STILL_BROKEN_CALC = '''"""A deliberately broken calculator, used as an agent fixture and M8's
+evaluation task set.
+
+Every public function below has exactly one self-contained, deliberately
+introduced bug (two, for divide(), average(), and factorial()), each
+independently detectable by its own test in test_calc.py. Fixing one
+function's bug never requires touching another function's code, so each is
+usable as its own isolated eval task.
+
+The bug in add() is intentional: test_calc.py fails against this file, which
+gives the agent (and the tool-layer tests) something real to detect and fix.
+"""
+
+
+def add(a, b):
+    """Return the sum of a and b."""
+    return a * b
+
+
+def subtract(a, b):
+    """Return a minus b."""
+    return a - b
+
+
+def modulo(a, b):
+    """Return the remainder of a divided by b."""
+    return b % a
+
+
+def square(x):
+    """Return x squared."""
+    return x * x + 1
+
+
+def max_value(numbers):
+    """Return the largest number in the list."""
+    result = 0
+    for n in numbers:
+        if n > result:
+            result = n
+    return result
+
+
+def _clean(s):
+    """Strip spaces so is_palindrome can compare characters directly."""
+    return s.replace(" ", "")
+
+
+def is_palindrome(s):
+    """Return True if s reads the same forwards and backwards."""
+    cleaned = _clean(s)
+    return cleaned == cleaned[::-1]
+
+
+def fibonacci(n):
+    """Return the nth Fibonacci number (0-indexed: fibonacci(0) == 0)."""
+    a, b = 0, 1
+    for _ in range(n):
+        a = b
+        b = a + b
+    return a
+
+
+def divide(a, b):
+    """Return a divided by b."""
+    return b / a
+
+
+def average(numbers):
+    """Return the arithmetic mean of numbers."""
+    total = sum(numbers)
+    return total / (len(numbers) - 1)
+
+
+def is_prime(n):
+    """Return True if n is a prime number, False otherwise."""
+    if n < 2:
+        return False
+    for i in range(2, int(n ** 0.5)):
+        if n % i == 0:
+            return False
+    return True
+
+
+def factorial(n):
+    """Return n! (n factorial)."""
+    result = 1
+    for i in range(1, n):
+        result *= i
+    return result
+'''
+
 
 # --------------------------------------------------------------------------
 # extract_code_block
@@ -199,14 +396,7 @@ def _stub_client(content: str) -> SimpleNamespace:
 
 
 def test_run_baseline_writes_the_fix_and_reports_passing_tests(calculator_ws: Workspace):
-    client = _stub_client(
-        "```python\ndef add(a, b):\n"
-        '    """Return the sum of a and b."""\n'
-        "    return a + b\n\n\n"
-        "def subtract(a, b):\n"
-        '    """Return a minus b."""\n'
-        "    return a - b\n```"
-    )
+    client = _stub_client(f"```python\n{_ALL_BUGS_FIXED_CALC}```")
     result = run_baseline(
         calculator_ws, "fix add()", "calculator/calc.py", client=client
     )
@@ -215,7 +405,7 @@ def test_run_baseline_writes_the_fix_and_reports_passing_tests(calculator_ws: Wo
     assert result["error"] is None
     assert "-    return a - b" in result["diff"]
     assert "+    return a + b" in result["diff"]
-    assert result["test_results"]["passed"] == 2
+    assert result["test_results"]["passed"] == 14  # every bug in the fixture fixed
     assert result["token_usage"] == {
         "prompt_tokens": 11,
         "completion_tokens": 22,
@@ -255,16 +445,15 @@ def test_run_baseline_reports_a_still_broken_fix(calculator_ws: Workspace):
         calculator_ws,
         "fix add()",
         "calculator/calc.py",
-        client=_stub_client(
-            "```python\ndef add(a, b):\n    return a * b\n\n\n"
-            "def subtract(a, b):\n    return a - b\n```"
-        ),
+        client=_stub_client(f"```python\n{_STILL_BROKEN_CALC}```"),
     )
 
     assert result["success"] is False
     assert result["error"] is None
     assert "+    return a * b" in result["diff"]
-    assert result["test_results"]["failed"] == 1
+    # add() is wrong differently; every other function is exactly as buggy as
+    # the shipped fixture (subtract is the only one that was ever correct).
+    assert result["test_results"]["failed"] == 13
     assert result["test_results"]["passed"] == 1
 
 
@@ -354,6 +543,6 @@ def test_baseline_fixes_the_calculator_end_to_end(calculator_ws: Workspace, caps
 
     # The test-suite outcome was captured, whatever it turned out to be.
     assert result["test_results"] is not None
-    assert result["test_results"]["total"] == 2
+    assert result["test_results"]["total"] == 14
     assert isinstance(result["success"], bool)
     assert result["success"] == result["test_results"]["success"]

@@ -1,0 +1,13 @@
+id: is_prime_misses_some_factors
+title: "is_prime() calls some non-prime numbers prime"
+description: |
+  is_prime(2) and is_prime(7) both correctly return True — as expected,
+  since both are prime.
+
+  But is_prime(4) also returns True, even though 4 is 2 times 2, so it
+  isn't prime. is_prime(9) returns True too, even though 9 is 3 times 3.
+  And is_prime(15) returns True, even though 15 is 3 times 5.
+fixture_repo: demo/sample_repos/calculator
+target_file: calculator/calc.py
+verify_command: "pytest calculator/test_calc.py::test_is_prime -v"
+difficulty: hard

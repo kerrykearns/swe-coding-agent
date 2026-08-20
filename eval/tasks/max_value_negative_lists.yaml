@@ -1,0 +1,14 @@
+id: max_value_negative_lists
+title: "max_value() returns the wrong answer for lists of all-negative numbers"
+description: |
+  max_value([1, 5, 3]) correctly returns 5, so the function seemed fine at
+  first.
+
+  But max_value([-5, -2, -8]) returns 0 — and there's no 0 anywhere in that
+  list, so that can't be the actual maximum. -2 is the largest number in
+  that list. It looks like it only goes wrong when every number in the list
+  is negative.
+fixture_repo: demo/sample_repos/calculator
+target_file: calculator/calc.py
+verify_command: "pytest calculator/test_calc.py::test_max_value -v"
+difficulty: medium

@@ -1,0 +1,12 @@
+id: fibonacci_wrong_sequence
+title: "fibonacci() gives correct values at first, then goes wrong"
+description: |
+  fibonacci(0) returns 0 and fibonacci(1) returns 1, both correct.
+
+  But fibonacci(5) returns 16. The 5th Fibonacci number should be 5. The
+  sequence starts out fine and then goes off the rails somewhere after the
+  first couple of terms.
+fixture_repo: demo/sample_repos/calculator
+target_file: calculator/calc.py
+verify_command: "pytest calculator/test_calc.py::test_fibonacci -v"
+difficulty: medium

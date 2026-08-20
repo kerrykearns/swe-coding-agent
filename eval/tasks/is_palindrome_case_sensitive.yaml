@@ -1,0 +1,13 @@
+id: is_palindrome_case_sensitive
+title: "is_palindrome() is inconsistent about capital letters"
+description: |
+  is_palindrome("racecar") correctly returns True.
+
+  But is_palindrome("Racecar") returns False, even though it's the exact
+  same word, just with the first letter capitalized. A palindrome check
+  shouldn't care about capitalization — "Racecar" reads the same forwards
+  and backwards just as much as "racecar" does.
+fixture_repo: demo/sample_repos/calculator
+target_file: calculator/calc.py
+verify_command: "pytest calculator/test_calc.py::test_is_palindrome -v"
+difficulty: medium

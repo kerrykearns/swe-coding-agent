@@ -1,0 +1,11 @@
+id: square_off_by_one
+title: "square() is off by one"
+description: |
+  square(4) returns 17. It should return 16.
+
+  square(0) returns 1 instead of 0. Every value I try comes back exactly one
+  higher than the number squared should actually be.
+fixture_repo: demo/sample_repos/calculator
+target_file: calculator/calc.py
+verify_command: "pytest calculator/test_calc.py::test_square -v"
+difficulty: trivial

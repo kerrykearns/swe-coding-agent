@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai import BadRequestError, OpenAI
+from openai import BadRequestError, OpenAI, RateLimitError
 
 from agent.core import llm_client
 from agent.core import react_agent as react_agent_module
@@ -43,14 +43,107 @@ from agent.core.react_agent import (
 )
 from agent.tools import Workspace, read_file
 
-FIXED_CALC = (
-    '"""A deliberately broken calculator, used as an agent fixture.\n\n'
-    "The bug in add() is intentional: test_calc.py fails against this file, which\n"
-    "gives the agent (and the tool-layer tests) something real to detect and fix.\n"
-    '"""\n\n\ndef add(a, b):\n    """Return the sum of a and b."""\n'
-    "    return a + b\n\n\ndef subtract(a, b):\n"
-    '    """Return a minus b."""\n    return a - b\n'
-)
+#: The fully-fixed calculator: every one of the fixture's ten deliberate
+#: bugs (see demo/sample_repos/calculator/calculator/calc.py) corrected, with
+#: everything else — docstrings, blank lines — left untouched. Used as the
+#: scripted "here is the corrected file" reply throughout this suite and
+#: imported downstream by test_run_on_issue.py / test_confirmation_gate.py, so
+#: there is exactly one definition of what "the fix landed" looks like.
+FIXED_CALC = '''"""A deliberately broken calculator, used as an agent fixture and M8's
+evaluation task set.
+
+Every public function below has exactly one self-contained, deliberately
+introduced bug (two, for divide(), average(), and factorial()), each
+independently detectable by its own test in test_calc.py. Fixing one
+function's bug never requires touching another function's code, so each is
+usable as its own isolated eval task.
+
+The bug in add() is intentional: test_calc.py fails against this file, which
+gives the agent (and the tool-layer tests) something real to detect and fix.
+"""
+
+
+def add(a, b):
+    """Return the sum of a and b."""
+    return a + b
+
+
+def subtract(a, b):
+    """Return a minus b."""
+    return a - b
+
+
+def modulo(a, b):
+    """Return the remainder of a divided by b."""
+    return a % b
+
+
+def square(x):
+    """Return x squared."""
+    return x * x
+
+
+def max_value(numbers):
+    """Return the largest number in the list."""
+    result = numbers[0]
+    for n in numbers[1:]:
+        if n > result:
+            result = n
+    return result
+
+
+def _clean(s):
+    """Strip spaces so is_palindrome can compare characters directly."""
+    return s.replace(" ", "").lower()
+
+
+def is_palindrome(s):
+    """Return True if s reads the same forwards and backwards."""
+    cleaned = _clean(s)
+    return cleaned == cleaned[::-1]
+
+
+def fibonacci(n):
+    """Return the nth Fibonacci number (0-indexed: fibonacci(0) == 0)."""
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+
+def divide(a, b):
+    """Return a divided by b."""
+    if b == 0:
+        raise ValueError("Cannot divide by zero")
+    return a / b
+
+
+def average(numbers):
+    """Return the arithmetic mean of numbers."""
+    if not numbers:
+        raise ValueError("average of empty list")
+    return sum(numbers) / len(numbers)
+
+
+def is_prime(n):
+    """Return True if n is a prime number, False otherwise."""
+    if n < 2:
+        return False
+    for i in range(2, int(n ** 0.5) + 1):
+        if n % i == 0:
+            return False
+    return True
+
+
+def factorial(n):
+    """Return n! (n factorial)."""
+    if n < 0:
+        raise ValueError("factorial is not defined for negative numbers")
+    result = 1
+    for i in range(1, n + 1):
+        result *= i
+    return result
+'''
 
 
 # --------------------------------------------------------------------------
@@ -636,7 +729,7 @@ def test_loop_reads_writes_tests_and_stops_the_moment_tests_pass(
     assert trajectory.total_turns == 3
     assert trajectory.total_tokens == 600
     assert trajectory.turns[0].reasoning.startswith("I should read the file")
-    assert trajectory.turns[2].tool_result["passed"] == 2
+    assert trajectory.turns[2].tool_result["passed"] == 14  # every bug in the fixture fixed
 
     # The fix really landed, and the diff was really captured.
     assert read_file(calculator_ws, "calculator/calc.py") == FIXED_CALC
@@ -767,7 +860,7 @@ def test_a_failing_test_run_does_not_stop_the_loop(calculator_ws: Workspace):
     trajectory = run_react_agent(calculator_ws, "fix add()", client=client)
 
     assert trajectory.turns[0].tool_result["success"] is False
-    assert trajectory.turns[0].tool_result["failed"] == 1
+    assert trajectory.turns[0].tool_result["failed"] == 13  # every bug still in place
     assert trajectory.stop_reason is StopReason.TESTS_PASSED
     assert trajectory.final_success is True
     assert trajectory.total_turns == 3
@@ -1013,6 +1106,44 @@ def test_a_failed_llm_call_ends_the_run_as_an_error(calculator_ws: Workspace):
     assert trajectory.final_success is False
 
 
+def _rate_limit_error() -> Exception:
+    """A real openai.RateLimitError, built from an actual httpx 429 response
+    the same way ``_tool_use_failed`` builds a real 400 above — so it carries
+    whatever shape the installed SDK actually gives a rate limit, not a guess.
+    """
+    payload = {
+        "error": {
+            "message": "Rate limit reached for this model.",
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+        }
+    }
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    response = httpx.Response(429, request=request, json=payload)
+    client = OpenAI(api_key="not-a-real-key", base_url=llm_client.DEFAULT_BASE_URL)
+    return client._make_status_error_from_response(response)
+
+
+def test_a_rate_limit_propagates_instead_of_ending_the_run_as_a_recorded_error(
+    calculator_ws: Workspace,
+):
+    """Unlike a generic connection failure (recorded above), a 429 is not this
+    run's failure — every subsequent call will hit the same exhausted quota,
+    so it must propagate out of the loop rather than being swallowed into a
+    normal (if failed) trajectory. eval.harness.run_task and
+    eval.run_eval.run_matrix both depend on seeing this exception themselves
+    to stop the whole eval matrix instead of burning through the rest of the
+    tasks re-discovering the same 429 one at a time.
+    """
+    client = _scripted_client(
+        _reply("Reading.", (_call("read_file", "c1", path="calculator/calc.py"),)),
+        _rate_limit_error(),
+    )
+
+    with pytest.raises(RateLimitError):
+        run_react_agent(calculator_ws, "fix add()", client=client)
+
+
 # --------------------------------------------------------------------------
 # The loop: what the model is actually sent
 # --------------------------------------------------------------------------
@@ -1053,7 +1184,7 @@ def test_observations_accumulate_in_the_conversation(calculator_ws: Workspace):
     roles = [message["role"] for message in third]
     assert roles == ["system", "user", "assistant", "tool", "assistant", "tool"]
     assert "return a - b" in third[3]["content"]  # the file the agent read
-    assert "calculator/calc.py:8" in third[5]["content"]  # the search result
+    assert "calculator/calc.py:15" in third[5]["content"]  # the search result
 
 
 def test_on_turn_is_called_live_as_each_turn_completes(calculator_ws: Workspace):
@@ -1461,7 +1592,10 @@ def test_react_agent_fixes_the_calculator_end_to_end(calculator_ws: Workspace, c
     """
     trajectory = run_react_agent(
         calculator_ws,
-        "fix add() so it returns the correct sum instead of subtracting",
+        "fix add() so it returns the correct sum instead of subtracting. "
+        "Verify with: pytest calculator/test_calc.py::test_add "
+        "calculator/test_calc.py::test_subtract -v — the rest of the file has "
+        "other unrelated failing tests that are not part of this task.",
         max_turns=8,
     )
 

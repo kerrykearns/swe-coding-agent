@@ -1,0 +1,16 @@
+id: factorial_wrong_result_and_unsafe_negative
+title: "factorial() returns the wrong result, and negative input doesn't fail safely"
+description: |
+  factorial(5) returns 24. It should return 120.
+
+  factorial(3) returns 2 instead of 6.
+
+  Separately: calling factorial(-1) doesn't raise anything I'd call a
+  meaningful error — it just quietly returns 1. Factorial isn't defined
+  for negative numbers, so it should refuse with a clear, well-behaved
+  error instead of whatever it's currently doing. These might be two
+  separate problems in the same function, not sure.
+fixture_repo: demo/sample_repos/calculator
+target_file: calculator/calc.py
+verify_command: "pytest calculator/test_calc.py::test_factorial calculator/test_calc.py::test_factorial_negative -v"
+difficulty: hard

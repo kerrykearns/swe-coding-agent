@@ -1,0 +1,16 @@
+id: average_wrong_mean_and_unsafe_empty
+title: "average() returns the wrong result, and an empty list doesn't fail safely"
+description: |
+  average([2, 4, 6]) returns 6.0. It should return 4.
+
+  average([1, 2, 3, 4]) returns 3.3333333333333335 instead of 2.5.
+
+  Separately: calling average([]) doesn't raise anything I'd call a
+  meaningful error — it just quietly returns -0.0. It should refuse to
+  average an empty list with a clear, well-behaved error instead of
+  whatever it's currently doing. These might be two separate problems in
+  the same function, not sure.
+fixture_repo: demo/sample_repos/calculator
+target_file: calculator/calc.py
+verify_command: "pytest calculator/test_calc.py::test_average calculator/test_calc.py::test_average_empty_list -v"
+difficulty: hard

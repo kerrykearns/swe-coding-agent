@@ -1,0 +1,14 @@
+id: divide_wrong_and_unsafe
+title: "divide() returns the wrong result, and dividing by zero doesn't fail safely"
+description: |
+  divide(6, 3) returns 0.5. It should return 2.
+
+  Separately: calling divide(5, 0) doesn't raise anything I'd call a
+  meaningful error — nothing that clearly says division by zero isn't
+  allowed. It should refuse to divide by zero with a clear, well-behaved
+  error instead of whatever it's currently doing. These might be two
+  separate problems in the same function, not sure.
+fixture_repo: demo/sample_repos/calculator
+target_file: calculator/calc.py
+verify_command: "pytest calculator/test_calc.py::test_divide calculator/test_calc.py::test_divide_by_zero -v"
+difficulty: hard
